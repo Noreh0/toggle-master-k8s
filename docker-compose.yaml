@@ -1,0 +1,125 @@
+services:
+  auth-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=root
+      - POSTGRES_PASSWORD=root
+      - POSTGRES_DB=auth_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./auth-service/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+  auth-service:
+    build:
+      context: ./auth-service
+      dockerfile: Dockerfile
+    depends_on:
+      - auth-db
+    environment:
+      - DATABASE_URL=REPLACE_WITH_AUTH_DATABASE_URL
+      - PORT=8001
+      - MASTER_KEY=REPLACE_WITH_MASTER_KEY
+    ports:
+      - "8001:8001"
+
+  flag-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=root
+      - POSTGRES_PASSWORD=root
+      - POSTGRES_DB=flag_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./flag-service/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  flag-service:
+    build:
+      context: ./flag-service
+      dockerfile: Dockerfile
+    depends_on:
+      - flag-db
+      - auth-service
+    environment:
+      - DATABASE_URL=REPLACE_WITH_FLAG_DATABASE_URL
+      - AUTH_SERVICE_URL=http://auth-service:8001
+    ports:
+      - "8002:8002"
+
+  targeting-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=root
+      - POSTGRES_PASSWORD=root
+      - POSTGRES_DB=targeting_db
+    ports:
+      - "5434:5432"
+    volumes:
+      - ./targeting-service/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+  targeting-service:
+    build:
+      context: ./targeting-service
+      dockerfile: Dockerfile
+    depends_on:
+      - targeting-db
+      - auth-service
+    environment:
+      - DATABASE_URL=REPLACE_WITH_TARGETING_DATABASE_URL
+      - AUTH_SERVICE_URL=http://auth-service:8001
+    ports:
+      - "8003:8003"
+
+  cache-evaluation:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+  evaluation-service:
+    build:
+      context: ./evaluation-service
+      dockerfile: Dockerfile
+    depends_on:
+      - auth-service
+      - flag-service
+      - targeting-service
+      - cache-evaluation
+    environment:
+      - PORT=8004
+      - REDIS_URL=redis://cache-evaluation:6379
+      - FLAG_SERVICE_URL=http://flag-service:8002
+      - TARGETING_SERVICE_URL=http://targeting-service:8003
+      - SERVICE_API_KEY=REPLACE_WITH_SERVICE_API_KEY
+      - AWS_SQS_URL=REPLACE_WITH_SQS_URL
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    ports:
+      - "8004:8004"
+
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    restart: unless-stopped
+    user: root
+    ports:
+      - "8000:8000"
+    volumes:
+      # Correção da barra: alinhado com o padrão da pasta do microsserviço
+      - ./analytics-service/db:/home/dynamodblocal/data
+    # Correção dos parâmetros: alterado para -sharedDb
+    command: "-jar DynamoDBLocal.jar -sharedDb -dbPath /home/dynamodblocal/data"
+  analytics-service:
+    build:
+      context: ./analytics-service
+      dockerfile: Dockerfile
+    environment:
+      - PORT=8005
+      - AWS_SQS_URL=REPLACE_WITH_SQS_URL
+      - AWS_DYNAMODB_TABLE=REPLACE_WITH_DYNAMODB_TABLE
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    ports:
+      - "8005:8005"
