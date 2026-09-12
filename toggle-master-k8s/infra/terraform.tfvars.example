@@ -1,8 +1,0 @@
-# Copie este arquivo para terraform.tfvars e preencha.
-# terraform.tfvars NUNCA deve ir para o git (adicione no .gitignore).
-
-db_password = "coloque-uma-senha-forte-aqui"
-
-# Opcional, sobrescrever defaults:
-# aws_region = "us-east-1"
-# project_name = "toggle-master"
