@@ -7,7 +7,7 @@ spec:
   project: default
 
   source:
-    repoURL: https://github.com/SEU_USUARIO/toggle-master-gitops.git # troque pelo seu repo
+    repoURL: https://github.com/Noreh0/toggle-master-gitops.git # troque pelo seu repo
     targetRevision: main
     path: apps/auth
 
