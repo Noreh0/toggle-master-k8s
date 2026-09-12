@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: evaluation-service
+  namespace: toggle-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: evaluation-service
+  template:
+    metadata:
+      labels:
+        app: evaluation-service
+    spec:
+      containers:
+      - name: evaluation-service
+        image: 339712930081.dkr.ecr.us-east-1.amazonaws.com/toggle-master-evaluation:latest
+        ports:
+        - containerPort: 8004
+        resources: # Importante para o HPA conseguir medir uso de CPU depois!
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+        env:
+        - name: PORT
+          value: "8004"
+        - name: REDIS_URL
+          value: "REPLACE_WITH_REDIS_URL" # copie do output "redis_endpoint" do terraform apply
+        - name: AWS_SQS_URL
+          value: "REPLACE_WITH_SQS_URL" # copie do output "sqs_queue_url" do terraform apply
+        - name: AWS_REGION
+          value: "us-east-1"
+        - name: FLAG_SERVICE_URL
+          value: "http://flag-service:8002"
+        - name: TARGETING_SERVICE_URL
+          value: "http://targeting-service:8003"
+        - name: SERVICE_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: SERVICE_API_KEY
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: evaluation-service
+  namespace: toggle-app
+spec:
+  ports:
+  - port: 8004
+    targetPort: 8004
+  selector:
+    app: evaluation-service

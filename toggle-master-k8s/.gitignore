@@ -1,0 +1,13 @@
+# Terraform
+infra/.terraform/
+infra/.terraform.lock.hcl
+infra/terraform.tfvars
+infra/*.tfstate
+infra/*.tfstate.backup
+
+# Secrets locais (nunca commitar)
+k8s/01-secrets.local.yaml
+services/*/.env
+
+# Diversos
+.DS_Store

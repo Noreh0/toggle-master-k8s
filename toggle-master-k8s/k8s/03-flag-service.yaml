@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flag-service
+  namespace: toggle-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flag-service
+  template:
+    metadata:
+      labels:
+        app: flag-service
+    spec:
+      containers:
+      - name: flag-service
+        image: 339712930081.dkr.ecr.us-east-1.amazonaws.com/toggle-master-flag:latest
+        ports:
+        - containerPort: 8002
+        env:
+        - name: PORT
+          value: "8002"
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: FLAG_DB_URL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flag-service
+  namespace: toggle-app
+spec:
+  ports:
+  - port: 8002
+    targetPort: 8002
+  selector:
+    app: flag-service
