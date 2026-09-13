@@ -6,7 +6,7 @@ terraform {
   # Crie-o manualmente uma vez (console, cli, ou um projeto Terraform
   # separado de "bootstrap") com versionamento habilitado.
   backend "s3" {
-    bucket       = "toggle-master-tfstate-SEUNOME" # troque por um nome único global
+    bucket       = "toggle-master-tfstate-noreh0" # troque por um nome único global
     key          = "infra/terraform.tfstate"
     region       = "us-east-1"
     use_lockfile = true # lock nativo do backend S3 (substitui DynamoDB lock table)
