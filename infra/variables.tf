@@ -39,8 +39,9 @@ variable "microservices" {
 }
 
 variable "eks_cluster_version" {
-  type    = string
-  default = "1.30"
+  description = "Versão do Kubernetes no EKS. Mantenha uma versão em suporte padrão (checar https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions-standard.html)"
+  type        = string
+  default     = "1.34"
 }
 
 variable "node_instance_types" {

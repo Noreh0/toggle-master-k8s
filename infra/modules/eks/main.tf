@@ -71,6 +71,7 @@ resource "aws_eks_node_group" "main" {
   node_group_name = "${var.project_name}-nodes"
   node_role_arn   = aws_iam_role.node.arn
   subnet_ids      = var.private_subnet_ids
+  ami_type        = "AL2023_x86_64_STANDARD" # AL2 não é mais publicado para EKS >= 1.34
 
   scaling_config {
     desired_size = 2

@@ -37,7 +37,8 @@ resource "aws_db_instance" "this" {
 
   identifier             = "${var.project_name}-${each.value}"
   engine                 = "postgres"
-  engine_version         = "16.3"
+  engine_version         = "16" # major version apenas: a AWS escolhe a minor mais recente disponível
+  allow_major_version_upgrade = false
   instance_class         = "db.t3.micro"
   allocated_storage      = 20
   db_name                = replace(each.value, "-", "_")
