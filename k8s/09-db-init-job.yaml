@@ -1,0 +1,52 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-init
+  namespace: toggle-app
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: db-init
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo ">> Inicializando auth-db..."
+              psql "$AUTH_DB_URL" -f /sql/auth-init.sql
+              echo ">> Inicializando flag-db..."
+              psql "$FLAG_DB_URL" -f /sql/flag-init.sql
+              echo ">> Inicializando targeting-db..."
+              psql "$TARGETING_DB_URL" -f /sql/targeting-init.sql
+              echo ">> OK - todos os schemas foram criados."
+          env:
+            - name: AUTH_DB_URL
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: AUTH_DB_URL }
+            - name: FLAG_DB_URL
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: FLAG_DB_URL }
+            - name: TARGETING_DB_URL
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: TARGETING_DB_URL }
+          volumeMounts:
+            - name: auth-sql
+              mountPath: /sql/auth-init.sql
+              subPath: init.sql
+            - name: flag-sql
+              mountPath: /sql/flag-init.sql
+              subPath: init.sql
+            - name: targeting-sql
+              mountPath: /sql/targeting-init.sql
+              subPath: init.sql
+      volumes:
+        - name: auth-sql
+          configMap: { name: auth-db-init }
+        - name: flag-sql
+          configMap: { name: flag-db-init }
+        - name: targeting-sql
+          configMap: { name: targeting-db-init }
