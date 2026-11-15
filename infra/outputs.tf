@@ -26,6 +26,11 @@ output "sqs_queue_url" {
   value = module.sqs.queue_url
 }
 
+output "sqs_dlq_url" {
+  description = "Fila de mensagens que falharam 5 vezes no processamento do analytics"
+  value       = module.sqs.dlq_url
+}
+
 output "ecr_repository_urls" {
   value = module.ecr.repository_urls
 }

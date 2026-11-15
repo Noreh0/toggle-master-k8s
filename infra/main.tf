@@ -62,3 +62,15 @@ module "ci_access" {
   project_name         = var.project_name
   ecr_repository_arns  = values(module.ecr.repository_arns)
 }
+
+module "workload_iam" {
+  source = "./modules/workload-iam"
+
+  project_name = var.project_name
+  cluster_name = module.eks.cluster_name
+  queue_arn    = module.sqs.queue_arn
+  table_arn    = module.dynamodb.table_arn
+
+  # Garante o add-on eks-pod-identity-agent antes das associações.
+  depends_on = [module.eks]
+}

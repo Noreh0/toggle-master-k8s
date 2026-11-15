@@ -1,0 +1,375 @@
+diff --git a/infra/README.md b/infra/README.md
+index 87ddc17..ab02eac 100644
+--- a/infra/README.md
++++ b/infra/README.md
+@@ -30,8 +30,21 @@ kubectl get nodes
+ - 3 instâncias RDS Postgres (`modules/rds`)
+ - 1 cluster Redis ElastiCache (`modules/elasticache`)
+ - 1 tabela DynamoDB `ToggleMasterAnalytics` (`modules/dynamodb`)
+-- 1 fila SQS (`modules/sqs`)
++- 1 fila SQS + 1 DLQ (mensagens que falham 5 vezes vão para a DLQ) (`modules/sqs`)
+ - 5 repositórios ECR, um por microsserviço (`modules/ecr`)
++- Add-on `eks-pod-identity-agent` (`modules/eks`) e roles de menor privilégio para os pods
++  `evaluation-service` (só `sqs:SendMessage`) e `analytics-service` (consome o SQS e grava
++  no DynamoDB), ligados às ServiceAccounts do namespace `toggle-app` (`modules/workload-iam`)
++
++## Permissões dos pods (EKS Pod Identity)
++Os pods não usam access key. As ServiceAccounts `evaluation-service` e `analytics-service`
++(criadas junto dos Deployments no GitOps) são associadas aos roles acima. Se renomear uma
++ServiceAccount, atualize `modules/workload-iam/main.tf` para o nome continuar batendo.
++
++## Segredos que mudam a cada `destroy`/`apply`
++Os endpoints de RDS e ElastiCache são novos a cada criação. Depois do `apply`, recrie o Secret
++`app-secrets` (ver `k8s/01-secrets.yaml`) com os valores dos outputs `rds_endpoints` e
++`redis_endpoint` (`REDIS_URL` = `redis://<redis_endpoint>:6379`).
+ 
+ ## Para destruir tudo (evitar custo)
+ ```bash
+diff --git a/infra/main.tf b/infra/main.tf
+index 3640180..98bcb66 100644
+--- a/infra/main.tf
++++ b/infra/main.tf
+@@ -62,3 +62,15 @@ module "ci_access" {
+   project_name         = var.project_name
+   ecr_repository_arns  = values(module.ecr.repository_arns)
+ }
++
++module "workload_iam" {
++  source = "./modules/workload-iam"
++
++  project_name = var.project_name
++  cluster_name = module.eks.cluster_name
++  queue_arn    = module.sqs.queue_arn
++  table_arn    = module.dynamodb.table_arn
++
++  # Garante o add-on eks-pod-identity-agent antes das associações.
++  depends_on = [module.eks]
++}
+diff --git a/infra/modules/dynamodb/main.tf b/infra/modules/dynamodb/main.tf
+index 25a511a..e5de405 100644
+--- a/infra/modules/dynamodb/main.tf
++++ b/infra/modules/dynamodb/main.tf
+@@ -1,10 +1,10 @@
+ resource "aws_dynamodb_table" "analytics" {
+   name         = "ToggleMasterAnalytics"
+   billing_mode = "PAY_PER_REQUEST" # on-demand, evita gerenciar capacity manualmente
+-  hash_key     = "id"
++  hash_key     = "event_id" # o analytics-service grava `event_id` (uuid) como chave de cada evento
+ 
+   attribute {
+-    name = "id"
++    name = "event_id"
+     type = "S"
+   }
+ 
+diff --git a/infra/modules/eks/main.tf b/infra/modules/eks/main.tf
+index 8fe1fa1..a7028a9 100644
+--- a/infra/modules/eks/main.tf
++++ b/infra/modules/eks/main.tf
+@@ -87,3 +87,14 @@ resource "aws_eks_node_group" "main" {
+     aws_iam_role_policy_attachment.node_ecr_readonly,
+   ]
+ }
++
++# ---------- Add-on: EKS Pod Identity Agent ----------
++# Entrega credenciais AWS temporárias aos pods (ver modules/workload-iam).
++# A permissão do agente já vem da AmazonEKSWorkerNodePolicy anexada ao role dos nodes.
++resource "aws_eks_addon" "pod_identity_agent" {
++  cluster_name = aws_eks_cluster.main.name
++  addon_name   = "eks-pod-identity-agent"
++
++  # É um DaemonSet: precisa de nodes para ficar saudável.
++  depends_on = [aws_eks_node_group.main]
++}
+diff --git a/infra/modules/sqs/main.tf b/infra/modules/sqs/main.tf
+index 229ed31..d84aabd 100644
+--- a/infra/modules/sqs/main.tf
++++ b/infra/modules/sqs/main.tf
+@@ -1,8 +1,25 @@
++# Dead-letter queue: recebe as mensagens que o analytics não conseguiu processar.
++# Sem ela, uma mensagem com falha voltava para a fila indefinidamente e o erro ficava invisível.
++resource "aws_sqs_queue" "dlq" {
++  name                      = "${var.project_name}-queue-dlq"
++  message_retention_seconds = 1209600 # 14 dias (máximo), tempo para investigar
++
++  tags = {
++    Name = "${var.project_name}-queue-dlq"
++  }
++}
++
+ resource "aws_sqs_queue" "main" {
+   name                       = "${var.project_name}-queue"
+   visibility_timeout_seconds = 30
+   message_retention_seconds  = 345600 # 4 dias
+ 
++  # Após 5 recebimentos sem delete (falha no processamento) a mensagem vai para a DLQ.
++  redrive_policy = jsonencode({
++    deadLetterTargetArn = aws_sqs_queue.dlq.arn
++    maxReceiveCount     = 5
++  })
++
+   tags = {
+     Name = "${var.project_name}-queue"
+   }
+diff --git a/infra/modules/sqs/outputs.tf b/infra/modules/sqs/outputs.tf
+index 966888f..a61ce1a 100644
+--- a/infra/modules/sqs/outputs.tf
++++ b/infra/modules/sqs/outputs.tf
+@@ -5,3 +5,11 @@ output "queue_url" {
+ output "queue_arn" {
+   value = aws_sqs_queue.main.arn
+ }
++
++output "dlq_url" {
++  value = aws_sqs_queue.dlq.url
++}
++
++output "dlq_arn" {
++  value = aws_sqs_queue.dlq.arn
++}
+diff --git a/infra/modules/workload-iam/main.tf b/infra/modules/workload-iam/main.tf
+new file mode 100644
+index 0000000..20f8e1f
+--- /dev/null
++++ b/infra/modules/workload-iam/main.tf
+@@ -0,0 +1,89 @@
++# Permissões AWS dos pods via EKS Pod Identity (sem access key e sem provider OIDC).
++# Cada ServiceAccount é associada a um role com o mínimo necessário.
++#
++# Requisitos:
++#   - add-on eks-pod-identity-agent no cluster (modules/eks)
++#   - ServiceAccounts com os nomes abaixo, criadas nos manifests do GitOps
++#   - SDKs com suporte a Pod Identity: aws-sdk-go >= 1.47.11 (evaluation)
++#     e boto3 >= 1.34.41 (analytics)
++
++locals {
++  evaluation_sa = "evaluation-service"
++  analytics_sa  = "analytics-service"
++}
++
++data "aws_iam_policy_document" "pods_trust" {
++  statement {
++    actions = ["sts:AssumeRole", "sts:TagSession"]
++
++    principals {
++      type        = "Service"
++      identifiers = ["pods.eks.amazonaws.com"]
++    }
++  }
++}
++
++# ---------- evaluation-service: só publica eventos no SQS ----------
++resource "aws_iam_role" "evaluation" {
++  name               = "${var.project_name}-evaluation-pod"
++  assume_role_policy = data.aws_iam_policy_document.pods_trust.json
++}
++
++data "aws_iam_policy_document" "evaluation" {
++  statement {
++    sid       = "PublishEvaluationEvents"
++    actions   = ["sqs:SendMessage"]
++    resources = [var.queue_arn]
++  }
++}
++
++resource "aws_iam_role_policy" "evaluation" {
++  name   = "sqs-send"
++  role   = aws_iam_role.evaluation.id
++  policy = data.aws_iam_policy_document.evaluation.json
++}
++
++resource "aws_eks_pod_identity_association" "evaluation" {
++  cluster_name    = var.cluster_name
++  namespace       = var.namespace
++  service_account = local.evaluation_sa
++  role_arn        = aws_iam_role.evaluation.arn
++}
++
++# ---------- analytics-service: consome o SQS e grava no DynamoDB ----------
++resource "aws_iam_role" "analytics" {
++  name               = "${var.project_name}-analytics-pod"
++  assume_role_policy = data.aws_iam_policy_document.pods_trust.json
++}
++
++data "aws_iam_policy_document" "analytics" {
++  statement {
++    sid = "ConsumeEvaluationEvents"
++    actions = [
++      "sqs:ReceiveMessage",
++      "sqs:DeleteMessage",
++      "sqs:ChangeMessageVisibility",
++      "sqs:GetQueueAttributes",
++    ]
++    resources = [var.queue_arn]
++  }
++
++  statement {
++    sid       = "WriteAnalyticsEvents"
++    actions   = ["dynamodb:PutItem"]
++    resources = [var.table_arn]
++  }
++}
++
++resource "aws_iam_role_policy" "analytics" {
++  name   = "sqs-consume-dynamodb-write"
++  role   = aws_iam_role.analytics.id
++  policy = data.aws_iam_policy_document.analytics.json
++}
++
++resource "aws_eks_pod_identity_association" "analytics" {
++  cluster_name    = var.cluster_name
++  namespace       = var.namespace
++  service_account = local.analytics_sa
++  role_arn        = aws_iam_role.analytics.arn
++}
+diff --git a/infra/modules/workload-iam/outputs.tf b/infra/modules/workload-iam/outputs.tf
+new file mode 100644
+index 0000000..98ab21f
+--- /dev/null
++++ b/infra/modules/workload-iam/outputs.tf
+@@ -0,0 +1,7 @@
++output "evaluation_role_arn" {
++  value = aws_iam_role.evaluation.arn
++}
++
++output "analytics_role_arn" {
++  value = aws_iam_role.analytics.arn
++}
+diff --git a/infra/modules/workload-iam/variables.tf b/infra/modules/workload-iam/variables.tf
+new file mode 100644
+index 0000000..c7c3518
+--- /dev/null
++++ b/infra/modules/workload-iam/variables.tf
+@@ -0,0 +1,23 @@
++variable "project_name" {
++  type = string
++}
++
++variable "cluster_name" {
++  type = string
++}
++
++variable "namespace" {
++  description = "Namespace onde os serviços rodam (precisa bater com os manifests do GitOps)"
++  type        = string
++  default     = "toggle-app"
++}
++
++variable "queue_arn" {
++  description = "ARN da fila SQS de eventos de avaliação"
++  type        = string
++}
++
++variable "table_arn" {
++  description = "ARN da tabela DynamoDB de analytics"
++  type        = string
++}
+diff --git a/infra/outputs.tf b/infra/outputs.tf
+index 7d51f13..87d627a 100644
+--- a/infra/outputs.tf
++++ b/infra/outputs.tf
+@@ -26,6 +26,11 @@ output "sqs_queue_url" {
+   value = module.sqs.queue_url
+ }
+ 
++output "sqs_dlq_url" {
++  description = "Fila de mensagens que falharam 5 vezes no processamento do analytics"
++  value       = module.sqs.dlq_url
++}
++
+ output "ecr_repository_urls" {
+   value = module.ecr.repository_urls
+ }
+diff --git a/k8s/01-secrets.yaml b/k8s/01-secrets.yaml
+index 1881051..7a9ac9e 100644
+--- a/k8s/01-secrets.yaml
++++ b/k8s/01-secrets.yaml
+@@ -11,4 +11,7 @@ stringData:
+   MASTER_KEY: "REPLACE_WITH_MASTER_KEY"
+   # Chave criada chamando POST /keys no auth-service (autenticado com a MASTER_KEY).
+   # Usada pelo evaluation-service para se autenticar no flag-service e no targeting-service.
+-  SERVICE_API_KEY: "REPLACE_WITH_SERVICE_API_KEY"
+\ No newline at end of file
++  SERVICE_API_KEY: "REPLACE_WITH_SERVICE_API_KEY"
++  # redis://<output redis_endpoint do terraform>:6379
++  # O endpoint do ElastiCache muda a cada destroy/apply, por isso fica no Secret e não no Git.
++  REDIS_URL: "REPLACE_WITH_REDIS_URL"
+\ No newline at end of file
+diff --git a/k8s/05-evaluation-service.yaml b/k8s/05-evaluation-service.yaml
+index cb54705..6ad82fe 100644
+--- a/k8s/05-evaluation-service.yaml
++++ b/k8s/05-evaluation-service.yaml
+@@ -13,6 +13,7 @@ spec:
+       labels:
+         app: evaluation-service
+     spec:
++      serviceAccountName: evaluation-service
+       containers:
+       - name: evaluation-service
+         image: 339712930081.dkr.ecr.us-east-1.amazonaws.com/toggle-master-evaluation:latest
+@@ -29,7 +30,10 @@ spec:
+         - name: PORT
+           value: "8004"
+         - name: REDIS_URL
+-          value: "REPLACE_WITH_REDIS_URL" # copie do output "redis_endpoint" do terraform apply
++          valueFrom:
++            secretKeyRef:
++              name: app-secrets
++              key: REDIS_URL
+         - name: AWS_SQS_URL
+           value: "REPLACE_WITH_SQS_URL" # copie do output "sqs_queue_url" do terraform apply
+         - name: AWS_REGION
+@@ -54,4 +58,11 @@ spec:
+   - port: 8004
+     targetPort: 8004
+   selector:
+-    app: evaluation-service
+\ No newline at end of file
++    app: evaluation-service
++---
++# Identidade AWS do pod (EKS Pod Identity), ver infra/modules/workload-iam
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: evaluation-service
++  namespace: toggle-app
+\ No newline at end of file
+diff --git a/k8s/06-analytics-service.yaml b/k8s/06-analytics-service.yaml
+index b55e2f5..783921d 100644
+--- a/k8s/06-analytics-service.yaml
++++ b/k8s/06-analytics-service.yaml
+@@ -13,6 +13,7 @@ spec:
+       labels:
+         app: analytics-service
+     spec:
++      serviceAccountName: analytics-service
+       containers:
+       - name: analytics-service
+         image: 339712930081.dkr.ecr.us-east-1.amazonaws.com/toggle-master-analytics:latest
+@@ -29,4 +30,11 @@ spec:
+         - name: AWS_SQS_URL
+           value: "REPLACE_WITH_SQS_URL"
+         - name: AWS_DYNAMODB_TABLE
+-          value: "ToggleMasterAnalytics" # precisa bater exatamente com o nome criado no Terraform (modules/dynamodb)
+\ No newline at end of file
++          value: "ToggleMasterAnalytics" # precisa bater exatamente com o nome criado no Terraform (modules/dynamodb)
++---
++# Identidade AWS do pod (EKS Pod Identity), ver infra/modules/workload-iam
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: analytics-service
++  namespace: toggle-app
+\ No newline at end of file
+diff --git a/services/analytics/requirements.txt b/services/analytics/requirements.txt
+index 7da9127..986fcc7 100644
+--- a/services/analytics/requirements.txt
++++ b/services/analytics/requirements.txt
+@@ -2,4 +2,4 @@ Flask==2.2.2
+ Werkzeug<3
+ gunicorn==20.1.0
+ python-dotenv==0.21.0
+-boto3==1.26.50
+\ No newline at end of file
++boto3==1.34.162
+\ No newline at end of file

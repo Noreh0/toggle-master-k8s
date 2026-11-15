@@ -87,3 +87,14 @@ resource "aws_eks_node_group" "main" {
     aws_iam_role_policy_attachment.node_ecr_readonly,
   ]
 }
+
+# ---------- Add-on: EKS Pod Identity Agent ----------
+# Entrega credenciais AWS temporárias aos pods (ver modules/workload-iam).
+# A permissão do agente já vem da AmazonEKSWorkerNodePolicy anexada ao role dos nodes.
+resource "aws_eks_addon" "pod_identity_agent" {
+  cluster_name = aws_eks_cluster.main.name
+  addon_name   = "eks-pod-identity-agent"
+
+  # É um DaemonSet: precisa de nodes para ficar saudável.
+  depends_on = [aws_eks_node_group.main]
+}
