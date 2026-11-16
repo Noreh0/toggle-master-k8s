@@ -13,6 +13,7 @@ spec:
       labels:
         app: analytics-service
     spec:
+      serviceAccountName: analytics-service
       containers:
       - name: analytics-service
         image: 339712930081.dkr.ecr.us-east-1.amazonaws.com/toggle-master-analytics:latest
@@ -30,3 +31,10 @@ spec:
           value: "REPLACE_WITH_SQS_URL"
         - name: AWS_DYNAMODB_TABLE
           value: "ToggleMasterAnalytics" # precisa bater exatamente com o nome criado no Terraform (modules/dynamodb)
+---
+# Identidade AWS do pod (EKS Pod Identity), ver infra/modules/workload-iam
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: analytics-service
+  namespace: toggle-app

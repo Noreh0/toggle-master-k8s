@@ -13,6 +13,7 @@ spec:
       labels:
         app: evaluation-service
     spec:
+      serviceAccountName: evaluation-service
       containers:
       - name: evaluation-service
         image: 339712930081.dkr.ecr.us-east-1.amazonaws.com/toggle-master-evaluation:latest
@@ -29,7 +30,10 @@ spec:
         - name: PORT
           value: "8004"
         - name: REDIS_URL
-          value: "REPLACE_WITH_REDIS_URL" # copie do output "redis_endpoint" do terraform apply
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: REDIS_URL
         - name: AWS_SQS_URL
           value: "REPLACE_WITH_SQS_URL" # copie do output "sqs_queue_url" do terraform apply
         - name: AWS_REGION
@@ -55,3 +59,10 @@ spec:
     targetPort: 8004
   selector:
     app: evaluation-service
+---
+# Identidade AWS do pod (EKS Pod Identity), ver infra/modules/workload-iam
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: evaluation-service
+  namespace: toggle-app
