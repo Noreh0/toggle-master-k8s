@@ -74,9 +74,9 @@ resource "aws_eks_node_group" "main" {
   ami_type        = "AL2023_x86_64_STANDARD" # AL2 não é mais publicado para EKS >= 1.34
 
   scaling_config {
-    desired_size = 2
-    max_size     = 3
-    min_size     = 1
+    desired_size = var.node_desired_size
+    max_size     = var.node_max_size
+    min_size     = var.node_min_size
   }
 
   instance_types = var.node_instance_types

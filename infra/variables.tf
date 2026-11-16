@@ -45,8 +45,31 @@ variable "eks_cluster_version" {
 }
 
 variable "node_instance_types" {
-  type    = list(string)
-  default = ["t3.medium"]
+  description = <<-EOT
+    Tipo das instâncias dos nodes. t3.medium (2 vCPU/4 GiB) não comporta a stack de
+    observabilidade: além da memória, o limite de pods por node (17 no t3.medium, 35 no
+    t3.large, por causa dos IPs por ENI) estoura com ArgoCD + Prometheus + Loki + OTel + apps.
+  EOT
+  type        = list(string)
+  default     = ["t3.large"]
+}
+
+variable "node_desired_size" {
+  description = "Quantidade desejada de nodes"
+  type        = number
+  default     = 2
+}
+
+variable "node_min_size" {
+  description = "Mínimo de nodes"
+  type        = number
+  default     = 2
+}
+
+variable "node_max_size" {
+  description = "Máximo de nodes (folga para o HPA/cluster crescer sem novo terraform apply)"
+  type        = number
+  default     = 3
 }
 
 variable "db_instances" {

@@ -15,9 +15,19 @@ spec:
     server: https://kubernetes.default.svc
     namespace: toggle-app
 
+  # O auto-reparo roda `kubectl rollout restart`, que grava essa annotation no pod template.
+  # Sem isto o selfHeal do ArgoCD pode tratá-la como drift e desfazer o restart.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/template/metadata/annotations/kubectl.kubernetes.io~1restartedAt
+        - /spec/replicas # quem controla as réplicas é o HPA (k8s/08-hpa.yaml)
+
   syncPolicy:
     automated:
       prune: true    # remove do cluster o que for removido do git
       selfHeal: true # desfaz mudanças manuais feitas via kubectl direto no cluster
     syncOptions:
+      - RespectIgnoreDifferences=true
       - CreateNamespace=false # o namespace já existe (criado no bootstrap manual)

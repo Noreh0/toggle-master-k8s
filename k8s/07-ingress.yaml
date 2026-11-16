@@ -1,22 +1,53 @@
+# Dois Ingress porque o rewrite do nginx vale para o objeto inteiro:
+#  - app-ingress-rewrite: /auth, /targeting e /evaluation chegam ao serviço SEM o prefixo
+#    (ex.: /evaluation/evaluate -> /evaluate, /auth/validate -> /validate);
+#  - app-ingress-flags: /flags já é a rota real do flag-service, então passa sem reescrever.
+# (A annotation antiga "ingress.kubernetes.io/rewrite-target" não é do nginx e era ignorada.)
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: app-ingress
+  name: app-ingress-rewrite
   namespace: toggle-app
   annotations:
-    ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
 spec:
   ingressClassName: nginx
   rules:
   - http:
       paths:
-      - path: /auth
-        pathType: Prefix
+      - path: /auth(/|$)(.*)
+        pathType: ImplementationSpecific
         backend:
           service:
             name: auth-service
             port:
               number: 8001
+      - path: /targeting(/|$)(.*)
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: targeting-service
+            port:
+              number: 8003
+      - path: /evaluation(/|$)(.*)
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: evaluation-service
+            port:
+              number: 8004
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-ingress-flags
+  namespace: toggle-app
+spec:
+  ingressClassName: nginx
+  rules:
+  - http:
+      paths:
       - path: /flags
         pathType: Prefix
         backend:
@@ -24,17 +55,3 @@ spec:
             name: flag-service
             port:
               number: 8002
-      - path: /targeting
-        pathType: Prefix
-        backend:
-          service:
-            name: targeting-service
-            port:
-              number: 8003
-      - path: /evaluation
-        pathType: Prefix
-        backend:
-          service:
-            name: evaluation-service
-            port:
-              number: 8004
