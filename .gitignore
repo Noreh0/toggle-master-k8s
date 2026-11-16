@@ -11,3 +11,6 @@ services/*/.env
 
 # Diversos
 .DS_Store
+
+# Segredos do bootstrap (nunca commitar)
+scripts/bootstrap.env

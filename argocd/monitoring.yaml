@@ -1,0 +1,23 @@
+# App-of-apps da observabilidade: aponta para monitoring/applications no repo GitOps, onde ficam
+# as Applications do Prometheus/Grafana, Loki e dos OTel Collectors (charts Helm + values).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: monitoring
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/Noreh0/toggle-master-gitops.git
+    targetRevision: main
+    path: monitoring/applications
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd # as Applications filhas são objetos do namespace do ArgoCD
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

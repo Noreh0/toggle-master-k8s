@@ -1,6 +1,7 @@
 name: CI - analytics
 
 on:
+  workflow_dispatch: # permite rodar manualmente (ex.: reconstruir as imagens depois de recriar o ECR)
   push:
     branches: [main]
     paths: ["services/analytics/**"]

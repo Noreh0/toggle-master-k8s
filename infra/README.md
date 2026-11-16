@@ -17,12 +17,23 @@ terraform plan
 terraform apply
 ```
 
-## Depois do apply
+## Depois do apply: bootstrap do cluster
+
+Tudo o que não é Terraform nem GitOps (ArgoCD, metrics-server, ingress, Secrets, schemas dos bancos e as
+Applications do ArgoCD) é feito por um único script, idempotente:
 
 ```bash
-aws eks update-kubeconfig --name toggle-master --region us-east-1
-kubectl get nodes
+cp scripts/bootstrap.env.example scripts/bootstrap.env   # preencha (o arquivo é ignorado pelo Git)
+scripts/bootstrap.sh            # cluster completo
+scripts/bootstrap.sh ci-keys    # access key nova do usuário de CI -> Secrets do GitHub (gh)
+scripts/bootstrap.sh ci         # reconstrói as 5 imagens no ECR (que volta vazio a cada destroy)
+scripts/bootstrap.sh service-key
+scripts/bootstrap.sh status
+scripts/bootstrap.sh ui         # ArgoCD (8080), Grafana (3000) e Prometheus (9090) no navegador
 ```
+
+Os nodes são `t3.large` (`node_instance_types`, `node_desired_size`, `node_min_size`, `node_max_size`):
+com `t3.medium` o limite de 17 pods por node estoura com ArgoCD + observabilidade + apps.
 
 ## O que é criado
 - VPC com subnets públicas/privadas, IGW e NAT Gateway (`modules/networking`)

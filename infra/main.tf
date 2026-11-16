@@ -16,6 +16,9 @@ module "eks" {
   public_subnet_ids    = module.networking.public_subnet_ids
   private_subnet_ids   = module.networking.private_subnet_ids
   node_instance_types  = var.node_instance_types
+  node_desired_size    = var.node_desired_size
+  node_min_size        = var.node_min_size
+  node_max_size        = var.node_max_size
 }
 
 module "rds" {
