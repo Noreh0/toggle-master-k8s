@@ -1,0 +1,378 @@
+From b6fb4bff5d87e4ffac292ca9cdba9ea1cd496d51 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 08:37:12 -0300
+Subject: [PATCH] feat(selfheal): workflow de rollout restart, acesso do CI ao
+ EKS e script de demo
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- .github/workflows/self-heal.yaml: workflow_dispatch que roda kubectl rollout restart e espera o rollout
+- Terraform: usuário de CI com eks:DescribeCluster e access entry (AmazonEKSEditPolicy só no namespace toggle-app);
+  cluster com authentication_mode API_AND_CONFIG_MAP
+- scripts/demo.sh: seed, carga, chaos on/off e status
+- bootstrap.sh: valores de preenchimento nos Secrets de alerta (Grafana não sobe com contact point vazio)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0143aTTEmngJvZQUbnnAAFek
+---
+ .github/workflows/self-heal.yaml     |  85 ++++++++++++++++++++
+ infra/main.tf                        |   2 +
+ infra/modules/ci-access/main.tf      |  43 ++++++++++
+ infra/modules/ci-access/variables.tf |  16 ++++
+ infra/modules/eks/main.tf            |   7 ++
+ scripts/bootstrap.sh                 |  19 +++--
+ scripts/demo.sh                      | 112 +++++++++++++++++++++++++++
+ 7 files changed, 274 insertions(+), 10 deletions(-)
+ create mode 100644 .github/workflows/self-heal.yaml
+ create mode 100755 scripts/demo.sh
+
+diff --git a/.github/workflows/self-heal.yaml b/.github/workflows/self-heal.yaml
+new file mode 100644
+index 0000000..5feb19c
+--- /dev/null
++++ b/.github/workflows/self-heal.yaml
+@@ -0,0 +1,85 @@
++name: Self-healing (rollout restart)
++
++# Auto-reparo acionado pelo alerta do Grafana (webhook -> API de workflow_dispatch do GitHub).
++# Também pode ser executado à mão na aba Actions. Reinicia o Deployment com `kubectl rollout restart`
++# e espera os pods novos ficarem prontos, deixando tudo registrado no log e no resumo da execução.
++on:
++  workflow_dispatch:
++    inputs:
++      deployment:
++        description: Deployment a reiniciar (namespace toggle-app)
++        required: true
++        default: auth-service
++        type: choice
++        options:
++          - auth-service
++          - flag-service
++          - targeting-service
++          - evaluation-service
++          - analytics-service
++      reason:
++        description: Motivo (aparece no log)
++        required: false
++        default: execução manual
++
++permissions:
++  contents: read
++
++# Alertas repetidos para o mesmo serviço não reiniciam em paralelo.
++concurrency:
++  group: self-heal-${{ inputs.deployment }}
++  cancel-in-progress: false
++
++env:
++  CLUSTER_NAME: toggle-master
++  NAMESPACE: toggle-app
++  AWS_REGION: us-east-1
++  DEPLOYMENT: ${{ inputs.deployment }}
++  REASON: ${{ inputs.reason }}
++
++jobs:
++  restart:
++    runs-on: ubuntu-latest
++    timeout-minutes: 10
++    steps:
++      - name: Contexto do incidente
++        run: |
++          echo "Início (UTC): $(date -u +%FT%TZ)"
++          echo "Deployment:   ${DEPLOYMENT} (namespace ${NAMESPACE})"
++          echo "Motivo:       ${REASON}"
++
++      - name: Configurar credenciais AWS
++        uses: aws-actions/configure-aws-credentials@v4
++        with:
++          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
++          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
++          aws-region: us-east-1
++
++      - name: Conectar ao cluster EKS
++        run: aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}"
++
++      - name: Pods antes do restart
++        run: kubectl -n "${NAMESPACE}" get pods -l "app=${DEPLOYMENT}" -o wide
++
++      - name: kubectl rollout restart
++        run: |
++          kubectl -n "${NAMESPACE}" rollout restart "deployment/${DEPLOYMENT}"
++          echo "Restart solicitado em $(date -u +%FT%TZ)"
++
++      - name: Aguardar os pods novos ficarem prontos
++        run: kubectl -n "${NAMESPACE}" rollout status "deployment/${DEPLOYMENT}" --timeout=180s
++
++      - name: Pods depois do restart e resumo
++        run: |
++          kubectl -n "${NAMESPACE}" get pods -l "app=${DEPLOYMENT}" -o wide
++          {
++            echo "## Auto-reparo executado"
++            echo
++            echo "- **Deployment:** \`${DEPLOYMENT}\` (namespace \`${NAMESPACE}\`)"
++            echo "- **Motivo:** ${REASON}"
++            echo "- **Concluído (UTC):** $(date -u +%FT%TZ)"
++            echo
++            echo '```'
++            kubectl -n "${NAMESPACE}" get pods -l "app=${DEPLOYMENT}"
++            echo '```'
++          } >> "$GITHUB_STEP_SUMMARY"
+diff --git a/infra/main.tf b/infra/main.tf
+index 343757c..c7463cc 100644
+--- a/infra/main.tf
++++ b/infra/main.tf
+@@ -64,6 +64,8 @@ module "ci_access" {
+ 
+   project_name         = var.project_name
+   ecr_repository_arns  = values(module.ecr.repository_arns)
++  cluster_name         = module.eks.cluster_name
++  cluster_arn          = module.eks.cluster_arn
+ }
+ 
+ module "workload_iam" {
+diff --git a/infra/modules/ci-access/main.tf b/infra/modules/ci-access/main.tf
+index 05da634..3901655 100644
+--- a/infra/modules/ci-access/main.tf
++++ b/infra/modules/ci-access/main.tf
+@@ -48,3 +48,46 @@ resource "aws_iam_user_policy_attachment" "ci_ecr_push" {
+ # Se fizéssemos, o Secret Access Key ficaria salvo em texto no terraform.tfstate.
+ # Gere a chave manualmente uma vez via CLI (ver README/RUNBOOK) e cole
+ # direto nos Secrets do GitHub — sem passar pelo Terraform.
++
++# ---------- Auto-reparo (workflow self-heal.yaml) ----------
++# O mesmo usuário de CI roda `kubectl rollout restart` quando o alerta do Grafana dispara.
++# Duas peças: (1) IAM: só consegue descrever o cluster para montar o kubeconfig;
++# (2) EKS access entry: dentro do cluster, só edita recursos do namespace da aplicação
++# (política gerenciada AmazonEKSEditPolicy com escopo no namespace; sem acesso a outros namespaces).
++data "aws_iam_policy_document" "eks_describe" {
++  statement {
++    sid       = "DescribeClusterForKubeconfig"
++    actions   = ["eks:DescribeCluster"]
++    resources = [var.cluster_arn]
++  }
++}
++
++resource "aws_iam_policy" "eks_describe" {
++  name        = "${var.project_name}-ci-eks-describe"
++  description = "Permite ao usuário de CI gerar o kubeconfig do cluster (auto-reparo)"
++  policy      = data.aws_iam_policy_document.eks_describe.json
++}
++
++resource "aws_iam_user_policy_attachment" "ci_eks_describe" {
++  user       = aws_iam_user.ci.name
++  policy_arn = aws_iam_policy.eks_describe.arn
++}
++
++resource "aws_eks_access_entry" "ci" {
++  cluster_name  = var.cluster_name
++  principal_arn = aws_iam_user.ci.arn
++  type          = "STANDARD"
++}
++
++resource "aws_eks_access_policy_association" "ci_edit_app_namespace" {
++  cluster_name  = var.cluster_name
++  principal_arn = aws_iam_user.ci.arn
++  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy"
++
++  access_scope {
++    type       = "namespace"
++    namespaces = [var.app_namespace]
++  }
++
++  depends_on = [aws_eks_access_entry.ci]
++}
+diff --git a/infra/modules/ci-access/variables.tf b/infra/modules/ci-access/variables.tf
+index 58e8ab3..b003c35 100644
+--- a/infra/modules/ci-access/variables.tf
++++ b/infra/modules/ci-access/variables.tf
+@@ -6,3 +6,19 @@ variable "ecr_repository_arns" {
+   description = "ARNs dos 5 repositórios ECR aos quais o usuário de CI pode dar push"
+   type        = list(string)
+ }
++
++variable "cluster_name" {
++  description = "Nome do cluster EKS onde o auto-reparo vai rodar `kubectl rollout restart`"
++  type        = string
++}
++
++variable "cluster_arn" {
++  description = "ARN do cluster EKS (permite eks:DescribeCluster para gerar o kubeconfig)"
++  type        = string
++}
++
++variable "app_namespace" {
++  description = "Namespace da aplicação: único lugar onde o usuário de CI tem permissão de edição no cluster"
++  type        = string
++  default     = "toggle-app"
++}
+diff --git a/infra/modules/eks/main.tf b/infra/modules/eks/main.tf
+index d0d09b1..42b2fbb 100644
+--- a/infra/modules/eks/main.tf
++++ b/infra/modules/eks/main.tf
+@@ -31,6 +31,13 @@ resource "aws_eks_cluster" "main" {
+     endpoint_public_access  = true
+   }
+ 
++  # Access entries (usadas pelo usuário de CI no auto-reparo) + aws-auth ConfigMap legado.
++  # O criador do cluster continua administrador.
++  access_config {
++    authentication_mode                         = "API_AND_CONFIG_MAP"
++    bootstrap_cluster_creator_admin_permissions = true
++  }
++
+   depends_on = [aws_iam_role_policy_attachment.cluster_policy]
+ }
+ 
+diff --git a/scripts/bootstrap.sh b/scripts/bootstrap.sh
+index 1da5d55..d740d59 100755
+--- a/scripts/bootstrap.sh
++++ b/scripts/bootstrap.sh
+@@ -200,17 +200,16 @@ phase_secrets() {
+     --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+   info "grafana-admin ($NS_MON) ok"
+ 
+-  local missing=()
+-  [[ -n "${PAGERDUTY_INTEGRATION_KEY:-}" ]] || missing+=(PAGERDUTY_INTEGRATION_KEY)
+-  [[ -n "${DISCORD_WEBHOOK_URL:-}" ]] || missing+=(DISCORD_WEBHOOK_URL)
+-  [[ -n "${GITHUB_DISPATCH_TOKEN:-}" ]] || missing+=(GITHUB_DISPATCH_TOKEN)
+-  if ((${#missing[@]})); then
+-    warn "Sem valor para: ${missing[*]} (os contact points do Grafana ficarão sem eles)."
+-  fi
++  # Valores vazios derrubariam o provisionamento dos contact points no start do Grafana,
++  # então entram valores de preenchimento (os envios para esses canais simplesmente falham).
++  local pd_key="${PAGERDUTY_INTEGRATION_KEY:-}" discord_url="${DISCORD_WEBHOOK_URL:-}" gh_token="${GITHUB_DISPATCH_TOKEN:-}"
++  [[ -n "$pd_key" ]] || { warn "PAGERDUTY_INTEGRATION_KEY vazia: o incidente não será criado."; pd_key="nao-configurado"; }
++  [[ -n "$discord_url" ]] || { warn "DISCORD_WEBHOOK_URL vazia: sem aviso no Discord."; discord_url="http://localhost/nao-configurado"; }
++  [[ -n "$gh_token" ]] || { warn "GITHUB_DISPATCH_TOKEN vazia: o auto-reparo não será disparado."; gh_token="nao-configurado"; }
+   kubectl -n "$NS_MON" create secret generic grafana-alerting-secrets \
+-    --from-literal=PAGERDUTY_INTEGRATION_KEY="${PAGERDUTY_INTEGRATION_KEY:-}" \
+-    --from-literal=DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL:-}" \
+-    --from-literal=GITHUB_DISPATCH_TOKEN="${GITHUB_DISPATCH_TOKEN:-}" \
++    --from-literal=PAGERDUTY_INTEGRATION_KEY="$pd_key" \
++    --from-literal=DISCORD_WEBHOOK_URL="$discord_url" \
++    --from-literal=GITHUB_DISPATCH_TOKEN="$gh_token" \
+     --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+   info "grafana-alerting-secrets ($NS_MON) ok"
+ }
+diff --git a/scripts/demo.sh b/scripts/demo.sh
+new file mode 100755
+index 0000000..9cfbe04
+--- /dev/null
++++ b/scripts/demo.sh
+@@ -0,0 +1,112 @@
++#!/usr/bin/env bash
++# Ferramentas para a demo da Fase 4 (carga, falha induzida e recuperação).
++#
++# Uso:  scripts/demo.sh <comando>
++#   seed        cria a flag "enable-new-dashboard" e a regra de 50% (idempotente)
++#   load [seg]  gera tráfego (evaluation, flag e targeting) por N segundos (padrão 300; Ctrl+C encerra)
++#   chaos on    faz o auth-service responder 500 em /validate (incidente induzido)
++#   chaos off   volta ao normal sem reiniciar (o auto-reparo faz isso reiniciando o pod)
++#   status      mostra pods do toggle-app e a idade deles (o restart zera a idade)
++#
++# Roteiro do vídeo: `seed` -> `load` (em um terminal) -> `chaos on` (em outro) -> acompanhar
++# Grafana (Firing), PagerDuty, Discord e a execução "Self-healing" na aba Actions do GitHub.
++set -Eeuo pipefail
++
++NS="toggle-app"
++FLAG="${DEMO_FLAG:-enable-new-dashboard}"
++PIDS=()
++
++log()  { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
++info() { printf '    %s\n' "$*"; }
++die()  { printf '\033[1;31m[erro]\033[0m %s\n' "$*" >&2; exit 1; }
++
++cleanup() {
++  local p
++  for p in "${PIDS[@]:-}"; do [[ -n "$p" ]] && kill "$p" 2>/dev/null || true; done
++}
++trap cleanup EXIT INT TERM
++
++secret_value() { kubectl -n "$NS" get secret app-secrets -o "jsonpath={.data.$1}" | base64 --decode; }
++
++# Abre um port-forward em segundo plano e espera o /health responder.
++pf() { # <serviço> <porta local> <porta do serviço>
++  kubectl -n "$NS" port-forward "svc/$1" "$2:$3" >/dev/null 2>&1 &
++  PIDS+=("$!")
++  for _ in $(seq 1 30); do
++    curl -fs "http://127.0.0.1:$2/health" >/dev/null 2>&1 && return 0
++    sleep 1
++  done
++  die "port-forward de $1 não respondeu em /health"
++}
++
++service_key() {
++  local k
++  k="$(secret_value SERVICE_API_KEY)"
++  [[ -n "$k" && "$k" != pendente-* ]] || die "SERVICE_API_KEY ainda não foi criada (scripts/bootstrap.sh service-key)."
++  printf '%s' "$k"
++}
++
++cmd_seed() {
++  log "Criando flag e regra de demonstração"
++  local key code
++  key="$(service_key)"
++  pf flag-service 18002 8002
++  pf targeting-service 18003 8003
++  code="$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18002/flags \
++    -H "Authorization: Bearer $key" -H 'Content-Type: application/json' \
++    -d "{\"name\":\"$FLAG\",\"description\":\"flag da demo\",\"is_enabled\":true}")"
++  info "POST /flags -> $code (201 criada, 409 já existia)"
++  code="$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18003/rules \
++    -H "Authorization: Bearer $key" -H 'Content-Type: application/json' \
++    -d "{\"flag_name\":\"$FLAG\",\"is_enabled\":true,\"rules\":{\"type\":\"PERCENTAGE\",\"value\":50}}")"
++  info "POST /rules -> $code (201 criada, 409 já existia)"
++}
++
++cmd_load() {
++  local secs="${1:-300}" key n=0 end ok=0 fail=0 c
++  key="$(service_key)"
++  log "Gerando tráfego por ${secs}s (Ctrl+C encerra)"
++  pf evaluation-service 18004 8004
++  pf flag-service 18002 8002
++  pf targeting-service 18003 8003
++  end=$((SECONDS + secs))
++  while ((SECONDS < end)); do
++    n=$((n + 1))
++    # evaluation (Redis, flag-service, targeting-service, SQS) e leituras diretas que validam a chave no auth
++    for url in \
++      "http://127.0.0.1:18004/evaluate?user_id=user-$((RANDOM % 500))&flag_name=$FLAG" \
++      "http://127.0.0.1:18002/flags/$FLAG" \
++      "http://127.0.0.1:18003/rules/$FLAG"; do
++      c="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $key" "$url" || echo 000)"
++      if [[ "$c" == 2* ]]; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
++    done
++    ((n % 10)) || info "requisições: ok=$ok falhas=$fail (último código $c)"
++    sleep 0.3
++  done
++  info "fim: ok=$ok falhas=$fail"
++}
++
++cmd_chaos() {
++  local mode="${1:-}" enabled master code
++  case "$mode" in on) enabled=true ;; off) enabled=false ;; *) die "use: chaos on|off" ;; esac
++  master="$(secret_value MASTER_KEY)"
++  pf auth-service 18001 8001
++  code="$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18001/admin/chaos \
++    -H "Authorization: Bearer $master" -H 'Content-Type: application/json' \
++    -d "{\"enabled\":$enabled}")"
++  [[ "$code" == 2* ]] || die "POST /admin/chaos -> $code (o auth-service foi reiniciado/está sem ENABLE_CHAOS?)"
++  info "chaos $mode aplicado (HTTP $code) em $(date +%H:%M:%S)"
++}
++
++cmd_status() {
++  kubectl -n "$NS" get pods -o wide
++}
++
++case "${1:-}" in
++  seed)   cmd_seed ;;
++  load)   shift; cmd_load "${1:-300}" ;;
++  chaos)  shift; cmd_chaos "${1:-}" ;;
++  status) cmd_status ;;
++  ""|-h|--help|help) sed -n '2,12p' "${BASH_SOURCE[0]}" ;;
++  *) die "comando desconhecido: $1 (use --help)" ;;
++esac
+-- 
+2.43.0
+
