@@ -1,0 +1,1268 @@
+From 805cbe7b3fafac5a0ad7ae4f5dbf57ed29bd46b1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 15 Nov 2026 22:50:43 -0300
+Subject: [PATCH] =?UTF-8?q?feat(otel):=20instrumenta=20os=205=20servi?=
+ =?UTF-8?q?=C3=A7os=20com=20OpenTelemetry=20(traces=20+=20m=C3=A9tricas)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- evaluation/auth (Go): otelhttp no servidor e no cliente HTTP, spans manuais
+  (Redis, SQS publish, SELECT api_keys), contador de eventos enviados, propagação
+  W3C traceparent para o SQS via MessageAttributes
+- flag/targeting/analytics (Python): telemetry.py compartilhado, auto-instrumentação
+  Flask/requests/psycopg2/botocore, logs com trace_id, analytics continua o trace
+  que vem pela fila (span CONSUMER)
+- auth: rota /admin/chaos (só com ENABLE_CHAOS=true) para a demo de auto-recuperação;
+  falha de banco agora responde 503 em vez de 401
+
+PENDENTE: rodar `go mod tidy` em services/auth e services/evaluation e commitar
+go.mod/go.sum (sem acesso ao proxy de módulos no ambiente onde isso foi escrito).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0143aTTEmngJvZQUbnnAAFek
+---
+ services/analytics/app.py           | 47 ++++++++++++++--
+ services/analytics/requirements.txt |  6 ++-
+ services/analytics/telemetry.py     | 82 ++++++++++++++++++++++++++++
+ services/auth/handlers.go           | 71 ++++++++++++++++++++++--
+ services/auth/main.go               | 25 ++++++++-
+ services/auth/telemetry.go          | 73 +++++++++++++++++++++++++
+ services/evaluation/cache.go        | 56 +++++++++++++++++++
+ services/evaluation/evaluator.go    | 50 +++++++++--------
+ services/evaluation/handlers.go     |  7 ++-
+ services/evaluation/main.go         | 21 +++++++-
+ services/evaluation/sqs.go          | 72 ++++++++++++++++++++++---
+ services/evaluation/telemetry.go    | 83 +++++++++++++++++++++++++++++
+ services/flag/app.py                |  7 ++-
+ services/flag/requirements.txt      |  8 ++-
+ services/flag/telemetry.py          | 82 ++++++++++++++++++++++++++++
+ services/targeting/app.py           |  7 ++-
+ services/targeting/requirements.txt |  8 ++-
+ services/targeting/telemetry.py     | 82 ++++++++++++++++++++++++++++
+ 18 files changed, 740 insertions(+), 47 deletions(-)
+ create mode 100644 services/analytics/telemetry.py
+ create mode 100644 services/auth/telemetry.go
+ create mode 100644 services/evaluation/cache.go
+ create mode 100644 services/evaluation/telemetry.go
+ create mode 100644 services/flag/telemetry.py
+ create mode 100644 services/targeting/telemetry.py
+
+diff --git a/services/analytics/app.py b/services/analytics/app.py
+index 79e8df6..0198339 100644
+--- a/services/analytics/app.py
++++ b/services/analytics/app.py
+@@ -9,14 +9,27 @@ import boto3
+ from botocore.exceptions import NoCredentialsError, ClientError
+ from flask import Flask, jsonify
+ from dotenv import load_dotenv
++from opentelemetry import metrics, trace
++from opentelemetry.propagate import extract
++from opentelemetry.trace import SpanKind, Status, StatusCode
++from telemetry import init_telemetry, log_format
+ 
+ 
+ # Minha é equipe é a melhor, pois estou sozinho
+ 
++# Telemetria (OpenTelemetry -> OTel Collector) antes do logging, para o formato incluir trace_id/span_id
++init_telemetry()
++
+ # Configura o logging
+-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
++logging.basicConfig(level=logging.INFO, format=log_format())
+ log = logging.getLogger(__name__)
+ 
++_tracer = trace.get_tracer("analytics-service")
++_events_processed = metrics.get_meter("analytics-service").create_counter(
++    "analytics.events.processed",
++    description="Eventos de avaliação processados do SQS (status=ok|error)",
++)
++
+ # Carrega .env para desenvolvimento local
+ load_dotenv()
+ 
+@@ -47,7 +60,30 @@ except Exception as e:
+ # --- SQS Worker ---
+ 
+ def process_message(message):
+-    """ Processa uma única mensagem SQS e a insere no DynamoDB """
++    """ Continua o trace iniciado no evaluation-service (traceparent nos MessageAttributes do SQS) """
++    carrier = {
++        key: value.get('StringValue')
++        for key, value in message.get('MessageAttributes', {}).items()
++        if value.get('StringValue')
++    }
++    with _tracer.start_as_current_span(
++        'SQS process',
++        context=extract(carrier),
++        kind=SpanKind.CONSUMER,
++        attributes={
++            'messaging.system': 'aws_sqs',
++            'messaging.operation': 'process',
++            'messaging.message.id': message.get('MessageId', ''),
++        },
++    ) as span:
++        ok = _process_message(message)
++        if not ok:
++            span.set_status(Status(StatusCode.ERROR, 'falha ao processar a mensagem'))
++        _events_processed.add(1, {'status': 'ok' if ok else 'error'})
++
++
++def _process_message(message):
++    """ Processa uma única mensagem SQS e a insere no DynamoDB. Retorna True se concluiu (e deletou). """
+     try:
+         log.info(f"Processando mensagem ID: {message['MessageId']}")
+         body = json.loads(message['Body'])
+@@ -77,16 +113,18 @@ def process_message(message):
+             QueueUrl=SQS_QUEUE_URL,
+             ReceiptHandle=message['ReceiptHandle']
+         )
++        return True
+ 
+     except json.JSONDecodeError:
+         log.error(f"Erro ao decodificar JSON da mensagem ID: {message['MessageId']}")
+-        # Não deleta a mensagem, pode ser uma "poison pill"
++        # Não deleta a mensagem, pode ser uma "poison pill" (vai para a DLQ após 5 tentativas)
+     except ClientError as e:
+         log.error(f"Erro do Boto3 (DynamoDB ou SQS) ao processar {message['MessageId']}: {e}")
+         # Não deleta a mensagem, tenta novamente
+     except Exception as e:
+         log.error(f"Erro inesperado ao processar {message['MessageId']}: {e}")
+         # Não deleta a mensagem, tenta novamente
++    return False
+ 
+ 
+ def sqs_worker_loop():
+@@ -98,7 +136,8 @@ def sqs_worker_loop():
+             response = sqs_client.receive_message(
+                 QueueUrl=SQS_QUEUE_URL,
+                 MaxNumberOfMessages=10,  # Processa em lotes de até 10
+-                WaitTimeSeconds=20
++                WaitTimeSeconds=20,
++                MessageAttributeNames=['All']  # traz o traceparent enviado pelo evaluation-service
+             )
+ 
+             messages = response.get('Messages', [])
+diff --git a/services/analytics/requirements.txt b/services/analytics/requirements.txt
+index 986fcc7..79ae645 100644
+--- a/services/analytics/requirements.txt
++++ b/services/analytics/requirements.txt
+@@ -2,4 +2,8 @@ Flask==2.2.2
+ Werkzeug<3
+ gunicorn==20.1.0
+ python-dotenv==0.21.0
+-boto3==1.34.162
+\ No newline at end of file
++boto3==1.34.162
++opentelemetry-sdk==1.45.2
++opentelemetry-exporter-otlp-proto-http==1.45.2
++opentelemetry-instrumentation-botocore==0.66b2
++opentelemetry-instrumentation-logging==0.66b2
+diff --git a/services/analytics/telemetry.py b/services/analytics/telemetry.py
+new file mode 100644
+index 0000000..8b9c669
+--- /dev/null
++++ b/services/analytics/telemetry.py
+@@ -0,0 +1,82 @@
++"""OpenTelemetry: traces e métricas via OTLP/HTTP para o OTel Collector.
++
++- Só é ativado se OTEL_EXPORTER_OTLP_ENDPOINT estiver definida (dev local fica sem telemetria).
++- Nome do serviço e atributos vêm de OTEL_SERVICE_NAME e OTEL_RESOURCE_ATTRIBUTES.
++- Deve rodar no processo que atende as requisições. O gunicorn, sem --preload, importa o app
++  dentro do worker (depois do fork), então as threads do exporter sobrevivem.
++"""
++import os
++
++_BASE_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
++_TRACE_FORMAT = (
++    "%(asctime)s %(levelname)s [%(name)s] "
++    "[trace_id=%(otelTraceID)s span_id=%(otelSpanID)s] %(message)s"
++)
++
++_enabled = False
++
++
++def telemetry_enabled():
++    return bool(os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
++
++
++def init_telemetry():
++    """Configura tracer/meter providers e instrumenta as bibliotecas presentes no serviço."""
++    global _enabled
++    if _enabled or not telemetry_enabled():
++        return _enabled
++
++    from opentelemetry import metrics, trace
++    from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
++    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
++    from opentelemetry.instrumentation.logging import LoggingInstrumentor
++    from opentelemetry.sdk.metrics import MeterProvider
++    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
++    from opentelemetry.sdk.resources import Resource
++    from opentelemetry.sdk.trace import TracerProvider
++    from opentelemetry.sdk.trace.export import BatchSpanProcessor
++
++    resource = Resource.create()  # lê OTEL_SERVICE_NAME e OTEL_RESOURCE_ATTRIBUTES
++
++    tracer_provider = TracerProvider(resource=resource)
++    tracer_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
++    trace.set_tracer_provider(tracer_provider)
++
++    reader = PeriodicExportingMetricReader(OTLPMetricExporter(), export_interval_millis=15000)
++    metrics.set_meter_provider(MeterProvider(resource=resource, metric_readers=[reader]))
++
++    # Acrescenta trace_id/span_id aos registros de log (o formato é definido em log_format())
++    LoggingInstrumentor().instrument(set_logging_format=False)
++
++    # Bibliotecas de saída: o que existir no serviço é instrumentado
++    try:
++        from opentelemetry.instrumentation.requests import RequestsInstrumentor
++        RequestsInstrumentor().instrument()
++    except ImportError:
++        pass
++    try:
++        from opentelemetry.instrumentation.psycopg2 import Psycopg2Instrumentor
++        Psycopg2Instrumentor().instrument()
++    except ImportError:
++        pass
++    try:
++        from opentelemetry.instrumentation.botocore import BotocoreInstrumentor
++        BotocoreInstrumentor().instrument()
++    except ImportError:
++        pass
++
++    _enabled = True
++    return True
++
++
++def instrument_flask(app):
++    """Instrumenta o app Flask: um span por requisição e métricas http.server.*."""
++    if not _enabled:
++        return
++    from opentelemetry.instrumentation.flask import FlaskInstrumentor
++    FlaskInstrumentor().instrument_app(app)
++
++
++def log_format():
++    """Formato de log: com trace_id/span_id só quando a telemetria está ativa."""
++    return _TRACE_FORMAT if _enabled else _BASE_FORMAT
+diff --git a/services/auth/handlers.go b/services/auth/handlers.go
+index 70b4a9b..6ad8c66 100644
+--- a/services/auth/handlers.go
++++ b/services/auth/handlers.go
+@@ -3,12 +3,23 @@ package main
+ import (
+ //	"crypto/sha256"
+ //	"encoding/hex"
++	"database/sql"
+ 	"encoding/json"
++	"errors"
+ 	"log"
+ 	"net/http"
+ 	"strings"
++	"sync/atomic"
++
++	"go.opentelemetry.io/otel/attribute"
++	"go.opentelemetry.io/otel/codes"
++	"go.opentelemetry.io/otel/trace"
+ )
+ 
++// chaosEnabled simula uma falha interna do serviço (só ligável com ENABLE_CHAOS=true).
++// Fica em memória de propósito: reiniciar o pod (self-healing) devolve o serviço ao normal.
++var chaosEnabled atomic.Bool
++
+ // Estrutura para o corpo da requisição de criação de chave
+ type CreateKeyRequest struct {
+ 	Name string `json:"name"`
+@@ -31,6 +42,13 @@ func (a *App) healthHandler(w http.ResponseWriter, r *http.Request) {
+ 
+ // validateKeyHandler verifica se uma chave de API (enviada via Header) é válida
+ func (a *App) validateKeyHandler(w http.ResponseWriter, r *http.Request) {
++	// Falha injetada (ver chaosHandler): responde 5xx até o pod ser reiniciado.
++	if chaosEnabled.Load() {
++		log.Println("Falha injetada (chaos): respondendo 500")
++		http.Error(w, "Falha interna injetada para teste de self-healing", http.StatusInternalServerError)
++		return
++	}
++
+ 	// Extrai a chave do header "Authorization: Bearer <key>"
+ 	authHeader := r.Header.Get("Authorization")
+ 	keyString := strings.TrimPrefix(authHeader, "Bearer ")
+@@ -45,11 +63,33 @@ func (a *App) validateKeyHandler(w http.ResponseWriter, r *http.Request) {
+ 
+ 	// Verifica se o hash existe no banco de dados
+ 	var id int
+-	err := a.DB.QueryRow("SELECT id FROM api_keys WHERE key_hash = $1 AND is_active = true", keyHash).Scan(&id)
++	ctx, span := tracer.Start(r.Context(), "SELECT api_keys",
++		trace.WithSpanKind(trace.SpanKindClient),
++		trace.WithAttributes(
++			attribute.String("db.system", "postgresql"),
++			attribute.String("db.operation", "SELECT"),
++			attribute.String("db.sql.table", "api_keys"),
++		),
++	)
++	err := a.DB.QueryRowContext(ctx, "SELECT id FROM api_keys WHERE key_hash = $1 AND is_active = true", keyHash).Scan(&id)
+ 	if err != nil {
+-		// Se não encontrar (sql.ErrNoRows), ou qualquer outro erro, a chave é inválida
+-		log.Printf("Falha na validação da chave (hash: %s...): %v", keyHash[:6], err)
+-		http.Error(w, "Chave de API inválida ou inativa", http.StatusUnauthorized)
++		span.RecordError(err)
++		if !errors.Is(err, sql.ErrNoRows) {
++			span.SetStatus(codes.Error, err.Error())
++		}
++	}
++	span.End()
++
++	if err != nil {
++		// Chave inexistente ou inativa: 401 (erro do cliente)
++		if errors.Is(err, sql.ErrNoRows) {
++			log.Printf("Falha na validação da chave (hash: %s...): chave inválida ou inativa", keyHash[:6])
++			http.Error(w, "Chave de API inválida ou inativa", http.StatusUnauthorized)
++			return
++		}
++		// Qualquer outro erro (banco fora, timeout) é falha NOSSA: 503, para aparecer como 5xx nas métricas/alertas
++		log.Printf("Erro ao consultar o banco na validação da chave: %v", err)
++		http.Error(w, "Serviço de validação indisponível", http.StatusServiceUnavailable)
+ 		return
+ 	}
+ 
+@@ -110,6 +150,29 @@ func (a *App) createKeyHandler(w http.ResponseWriter, r *http.Request) {
+ 	}
+ }
+ 
++// chaosHandler liga/desliga a falha injetada: POST /admin/chaos {"enabled": true|false}
++// (protegido pelo masterKeyAuthMiddleware; registrado só com ENABLE_CHAOS=true)
++func (a *App) chaosHandler(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost {
++		http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
++		return
++	}
++
++	var req struct {
++		Enabled bool `json:"enabled"`
++	}
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++		http.Error(w, "Corpo da requisição inválido", http.StatusBadRequest)
++		return
++	}
++
++	chaosEnabled.Store(req.Enabled)
++	log.Printf("Chaos alterado: enabled=%t", req.Enabled)
++	if err := json.NewEncoder(w).Encode(map[string]bool{"chaos": req.Enabled}); err != nil {
++		log.Printf("Erro ao escrever resposta do chaos: %v", err)
++	}
++}
++
+ // --- Middleware ---
+ 
+ // masterKeyAuthMiddleware protege endpoints que só podem ser acessados com a MASTER_KEY
+diff --git a/services/auth/main.go b/services/auth/main.go
+index ab6ee1d..2b779b1 100644
+--- a/services/auth/main.go
++++ b/services/auth/main.go
+@@ -1,6 +1,7 @@
+ package main
+ 
+ import (
++	"context"
+ 	"database/sql"
+ //	"fmt"
+ 	"log"
+@@ -9,6 +10,7 @@ import (
+ 
+ 	_ "github.com/jackc/pgx/v4/stdlib"
+ 	"github.com/joho/godotenv"
++	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+ )
+ 
+ // App struct (para injeção de dependência)
+@@ -21,6 +23,13 @@ func main() {
+ 	// Carrega o .env para desenvolvimento local. Em produção, isso não fará nada.
+ 	_ = godotenv.Load()
+ 
++	// --- Telemetria (OpenTelemetry -> OTel Collector) ---
++	shutdownTelemetry, err := initTelemetry(context.Background())
++	if err != nil {
++		log.Printf("Aviso: falha ao iniciar a telemetria, seguindo sem ela: %v", err)
++	}
++	defer shutdownTelemetry(context.Background())
++
+ 	// --- Configuração ---
+ 	port := os.Getenv("PORT")
+ 	if port == "" {
+@@ -60,8 +69,22 @@ func main() {
+ 	// Eles são protegidos pelo middleware de autenticação
+ 	mux.Handle("/admin/keys", app.masterKeyAuthMiddleware(http.HandlerFunc(app.createKeyHandler)))
+ 
++	// Falha injetável para demonstrar o self-healing: só existe com ENABLE_CHAOS=true.
++	// Protegido pela MASTER_KEY. A falha fica em memória, então um restart do pod a limpa.
++	if os.Getenv("ENABLE_CHAOS") == "true" {
++		mux.Handle("/admin/chaos", app.masterKeyAuthMiddleware(http.HandlerFunc(app.chaosHandler)))
++		log.Println("ATENÇÃO: endpoint /admin/chaos habilitado (ENABLE_CHAOS=true)")
++	}
++
++	// Instrumenta o servidor: um span por requisição + métricas http.server.* (taxa, latência, status).
++	handler := otelhttp.NewHandler(mux, "auth-service",
++		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
++			return r.Method + " " + r.URL.Path
++		}),
++	)
++
+ 	log.Printf("Serviço de Autenticação (Go) rodando na porta %s", port)
+-	if err := http.ListenAndServe(":"+port, mux); err != nil {
++	if err := http.ListenAndServe(":"+port, handler); err != nil {
+ 		log.Fatal(err)
+ 	}
+ }
+diff --git a/services/auth/telemetry.go b/services/auth/telemetry.go
+new file mode 100644
+index 0000000..eed26aa
+--- /dev/null
++++ b/services/auth/telemetry.go
+@@ -0,0 +1,73 @@
++package main
++
++import (
++	"context"
++	"log"
++	"os"
++	"time"
++
++	"go.opentelemetry.io/otel"
++	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
++	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
++	"go.opentelemetry.io/otel/propagation"
++	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
++	"go.opentelemetry.io/otel/sdk/resource"
++	sdktrace "go.opentelemetry.io/otel/sdk/trace"
++)
++
++var tracer = otel.Tracer("auth-service")
++
++// initTelemetry configura traces e métricas OpenTelemetry (OTLP/HTTP para o OTel Collector).
++// O endpoint vem de OTEL_EXPORTER_OTLP_ENDPOINT e o nome do serviço de OTEL_SERVICE_NAME.
++// Sem endpoint, a telemetria fica desligada (dev local). Sempre devolve uma função de shutdown segura.
++func initTelemetry(ctx context.Context) (func(context.Context), error) {
++	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
++		propagation.TraceContext{}, propagation.Baggage{},
++	))
++
++	noop := func(context.Context) {}
++	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") == "" {
++		log.Println("Telemetria OpenTelemetry desabilitada (OTEL_EXPORTER_OTLP_ENDPOINT não definida).")
++		return noop, nil
++	}
++
++	res, err := resource.New(ctx,
++		resource.WithFromEnv(),
++		resource.WithTelemetrySDK(),
++		resource.WithHost(),
++	)
++	if err != nil {
++		return noop, err
++	}
++
++	traceExp, err := otlptracehttp.New(ctx)
++	if err != nil {
++		return noop, err
++	}
++	tp := sdktrace.NewTracerProvider(
++		sdktrace.WithBatcher(traceExp),
++		sdktrace.WithResource(res),
++	)
++	otel.SetTracerProvider(tp)
++
++	metricExp, err := otlpmetrichttp.New(ctx)
++	if err != nil {
++		_ = tp.Shutdown(ctx)
++		return noop, err
++	}
++	mp := sdkmetric.NewMeterProvider(
++		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricExp, sdkmetric.WithInterval(15*time.Second))),
++		sdkmetric.WithResource(res),
++	)
++	otel.SetMeterProvider(mp)
++
++	log.Println("Telemetria OpenTelemetry habilitada.")
++	return func(c context.Context) {
++		if err := tp.Shutdown(c); err != nil {
++			log.Printf("Erro ao encerrar o tracer provider: %v", err)
++		}
++		if err := mp.Shutdown(c); err != nil {
++			log.Printf("Erro ao encerrar o meter provider: %v", err)
++		}
++	}, nil
++}
+diff --git a/services/evaluation/cache.go b/services/evaluation/cache.go
+new file mode 100644
+index 0000000..c39fa79
+--- /dev/null
++++ b/services/evaluation/cache.go
+@@ -0,0 +1,56 @@
++package main
++
++import (
++	"context"
++	"errors"
++	"time"
++
++	"github.com/go-redis/redis/v8"
++	"go.opentelemetry.io/otel/attribute"
++	"go.opentelemetry.io/otel/codes"
++	"go.opentelemetry.io/otel/trace"
++)
++
++// redisGet lê uma chave do Redis dentro de um span (db.system=redis), para o Redis
++// aparecer no trace e no Service Map. Redis Nil (cache miss) não é tratado como erro.
++func (a *App) redisGet(ctx context.Context, key string) (string, error) {
++	ctx, span := tracer.Start(ctx, "redis GET",
++		trace.WithSpanKind(trace.SpanKindClient),
++		trace.WithAttributes(
++			attribute.String("db.system", "redis"),
++			attribute.String("db.operation", "GET"),
++		),
++	)
++	defer span.End()
++
++	val, err := a.RedisClient.Get(ctx, key).Result()
++	switch {
++	case err == nil:
++		span.SetAttributes(attribute.Bool("cache.hit", true))
++	case errors.Is(err, redis.Nil):
++		span.SetAttributes(attribute.Bool("cache.hit", false))
++	default:
++		span.RecordError(err)
++		span.SetStatus(codes.Error, err.Error())
++	}
++	return val, err
++}
++
++// redisSet grava uma chave no Redis dentro de um span.
++func (a *App) redisSet(ctx context.Context, key string, value interface{}, ttl time.Duration) error {
++	ctx, span := tracer.Start(ctx, "redis SET",
++		trace.WithSpanKind(trace.SpanKindClient),
++		trace.WithAttributes(
++			attribute.String("db.system", "redis"),
++			attribute.String("db.operation", "SET"),
++		),
++	)
++	defer span.End()
++
++	err := a.RedisClient.Set(ctx, key, value, ttl).Err()
++	if err != nil {
++		span.RecordError(err)
++		span.SetStatus(codes.Error, err.Error())
++	}
++	return err
++}
+diff --git a/services/evaluation/evaluator.go b/services/evaluation/evaluator.go
+index e972959..8bd55a2 100644
+--- a/services/evaluation/evaluator.go
++++ b/services/evaluation/evaluator.go
+@@ -1,6 +1,7 @@
+ package main
+ 
+ import (
++	"context"
+ 	"crypto/sha1"
+ 	"encoding/binary"
+ 	"encoding/json"
+@@ -19,9 +20,9 @@ const (
+ )
+ 
+ // getDecision é o wrapper principal
+-func (a *App) getDecision(userID, flagName string) (bool, error) {
++func (a *App) getDecision(ctx context.Context, userID, flagName string) (bool, error) {
+ 	// 1. Obter os dados da flag (do cache ou dos serviços)
+-	info, err := a.getCombinedFlagInfo(flagName)
++	info, err := a.getCombinedFlagInfo(ctx, flagName)
+ 	if err != nil {
+ 		return false, err
+ 	}
+@@ -31,11 +32,11 @@ func (a *App) getDecision(userID, flagName string) (bool, error) {
+ }
+ 
+ // getCombinedFlagInfo busca os dados no Redis, com fallback para os microsserviços
+-func (a *App) getCombinedFlagInfo(flagName string) (*CombinedFlagInfo, error) {
++func (a *App) getCombinedFlagInfo(ctx context.Context, flagName string) (*CombinedFlagInfo, error) {
+ 	cacheKey := fmt.Sprintf("flag_info:%s", flagName)
+ 
+ 	// 1. Tentar buscar do Cache (Redis)
+-	val, err := a.RedisClient.Get(ctx, cacheKey).Result()
++	val, err := a.redisGet(ctx, cacheKey)
+ 	if err == nil {
+ 		// Cache HIT
+ 		var info CombinedFlagInfo
+@@ -46,10 +47,10 @@ func (a *App) getCombinedFlagInfo(flagName string) (*CombinedFlagInfo, error) {
+ 		// Se o unmarshal falhar, trata como cache miss
+ 		log.Printf("Erro ao desserializar cache para flag '%s': %v", flagName, err)
+ 	}
+-	
++
+ 	log.Printf("Cache MISS para flag '%s'", flagName)
+ 	// 2. Cache MISS - Buscar dos serviços
+-	info, err := a.fetchFromServices(flagName)
++	info, err := a.fetchFromServices(ctx, flagName)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -57,7 +58,7 @@ func (a *App) getCombinedFlagInfo(flagName string) (*CombinedFlagInfo, error) {
+ 	// 3. Salvar no Cache
+ 	jsonData, err := json.Marshal(info)
+ 	if err == nil {
+-		if setErr := a.RedisClient.Set(ctx, cacheKey, jsonData, CACHE_TTL).Err(); setErr != nil {
++		if setErr := a.redisSet(ctx, cacheKey, jsonData, CACHE_TTL); setErr != nil {
+ 			log.Printf("Aviso: falha ao salvar no cache para flag '%s': %v", flagName, setErr)
+ 		}
+ 	}
+@@ -66,7 +67,7 @@ func (a *App) getCombinedFlagInfo(flagName string) (*CombinedFlagInfo, error) {
+ }
+ 
+ // fetchFromServices busca dados do flag-service e targeting-service concorrentemente
+-func (a *App) fetchFromServices(flagName string) (*CombinedFlagInfo, error) {
++func (a *App) fetchFromServices(ctx context.Context, flagName string) (*CombinedFlagInfo, error) {
+ 	var wg sync.WaitGroup
+ 	wg.Add(2)
+ 
+@@ -77,13 +78,13 @@ func (a *App) fetchFromServices(flagName string) (*CombinedFlagInfo, error) {
+ 	// Goroutine 1: Buscar do flag-service
+ 	go func() {
+ 		defer wg.Done()
+-		flagInfo, flagErr = a.fetchFlag(flagName)
++		flagInfo, flagErr = a.fetchFlag(ctx, flagName)
+ 	}()
+ 
+ 	// Goroutine 2: Buscar do targeting-service
+ 	go func() {
+ 		defer wg.Done()
+-		ruleInfo, ruleErr = a.fetchRule(flagName)
++		ruleInfo, ruleErr = a.fetchRule(ctx, flagName)
+ 	}()
+ 
+ 	wg.Wait()
+@@ -101,14 +102,18 @@ func (a *App) fetchFromServices(flagName string) (*CombinedFlagInfo, error) {
+ 	}, nil
+ }
+ 
+-// fetchFlag (função helper)
+-func (a *App) fetchFlag(flagName string) (*Flag, error) {
++// fetchFlag (função helper). O ctx leva o span da requisição: o transporte HTTP
++// instrumentado propaga o traceparent para o flag-service.
++func (a *App) fetchFlag(ctx context.Context, flagName string) (*Flag, error) {
+ 	url := fmt.Sprintf("%s/flags/%s", a.FlagServiceURL, flagName)
+ 
+ 	apiKey := os.Getenv("SERVICE_API_KEY")
+-	req, _ := http.NewRequest("GET", url, nil)
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
++	if err != nil {
++		return nil, fmt.Errorf("erro ao montar requisição para o flag-service: %w", err)
++	}
+ 	req.Header.Set("Authorization", "Bearer "+apiKey)
+-	
++
+ 	resp, err := a.HttpClient.Do(req)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("erro ao chamar flag-service: %w", err)
+@@ -130,12 +135,15 @@ func (a *App) fetchFlag(flagName string) (*Flag, error) {
+ 	return &flag, nil
+ }
+ 
+-func (a *App) fetchRule(flagName string) (*TargetingRule, error) {
++func (a *App) fetchRule(ctx context.Context, flagName string) (*TargetingRule, error) {
+ 	url := fmt.Sprintf("%s/rules/%s", a.TargetingServiceURL, flagName)
+ 	apiKey := os.Getenv("SERVICE_API_KEY") // Usa a mesma chave
+-	req, _ := http.NewRequest("GET", url, nil)
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
++	if err != nil {
++		return nil, fmt.Errorf("erro ao montar requisição para o targeting-service: %w", err)
++	}
+ 	req.Header.Set("Authorization", "Bearer "+apiKey)
+-	
++
+ 	resp, err := a.HttpClient.Do(req)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("erro ao chamar targeting-service: %w", err)
+@@ -176,10 +184,10 @@ func (a *App) runEvaluationLogic(info *CombinedFlagInfo, userID string) bool {
+ 			log.Printf("Erro: valor da regra de porcentagem não é um número para a flag '%s'", info.Flag.Name)
+ 			return false
+ 		}
+-		
++
+ 		// Calcula o "bucket" do usuário (0-99)
+ 		userBucket := getDeterministicBucket(userID + info.Flag.Name)
+-		
++
+ 		if float64(userBucket) < percentage {
+ 			return true
+ 		}
+@@ -193,10 +201,10 @@ func getDeterministicBucket(input string) int {
+ 	hasher := sha1.New()
+ 	hasher.Write([]byte(input))
+ 	hash := hasher.Sum(nil)
+-	
++
+ 	// Converte 4 bytes para um uint32
+ 	val := binary.BigEndian.Uint32(hash[:4])
+-	
++
+ 	// Retorna o módulo 100
+ 	return int(val % 100)
+ }
+diff --git a/services/evaluation/handlers.go b/services/evaluation/handlers.go
+index a507142..15e654d 100644
+--- a/services/evaluation/handlers.go
++++ b/services/evaluation/handlers.go
+@@ -1,6 +1,7 @@
+ package main
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"log"
+ 	"net/http"
+@@ -33,7 +34,8 @@ func (a *App) evaluationHandler(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	// 2. Obter a decisão (lógica de cache/serviço está em evaluator.go)
+-	result, err := a.getDecision(userID, flagName)
++	ctx := r.Context() // carrega o span da requisição (e o traceparent recebido)
++	result, err := a.getDecision(ctx, userID, flagName)
+ 	if err != nil {
+ 		// Se o erro for "não encontrado", retornamos 'false' (comportamento seguro)
+ 		if _, ok := err.(*NotFoundError); ok {
+@@ -48,7 +50,8 @@ func (a *App) evaluationHandler(w http.ResponseWriter, r *http.Request) {
+ 
+ 	// 3. Enviar evento para SQS (assincronamente)
+ 	// Isso não bloqueia a resposta para o cliente.
+-	go a.sendEvaluationEvent(userID, flagName, result)
++	// WithoutCancel mantém o span/trace, mas não morre quando a resposta HTTP termina.
++	go a.sendEvaluationEvent(context.WithoutCancel(ctx), userID, flagName, result)
+ 
+ 	// 4. Retornar a resposta
+ 	w.WriteHeader(http.StatusOK)
+diff --git a/services/evaluation/main.go b/services/evaluation/main.go
+index 63a8ec7..db98271 100644
+--- a/services/evaluation/main.go
++++ b/services/evaluation/main.go
+@@ -12,6 +12,7 @@ import (
+ 	"github.com/aws/aws-sdk-go/service/sqs"
+ 	"github.com/go-redis/redis/v8"
+ 	"github.com/joho/godotenv"
++	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+ )
+ 
+ // Contexto global para o Redis
+@@ -30,6 +31,13 @@ type App struct {
+ func main() {
+ 	_ = godotenv.Load() // Carrega .env para dev local
+ 
++	// --- Telemetria (OpenTelemetry -> OTel Collector) ---
++	shutdownTelemetry, err := initTelemetry(ctx)
++	if err != nil {
++		log.Printf("Aviso: falha ao iniciar a telemetria, seguindo sem ela: %v", err)
++	}
++	defer shutdownTelemetry(context.Background())
++
+ 	// --- Configuração ---
+ 	port := os.Getenv("PORT")
+ 	if port == "" {
+@@ -86,8 +94,10 @@ func main() {
+ 	}
+ 
+ 	// Cliente HTTP (com timeout)
++	// O transporte instrumentado cria o span de cliente e propaga o traceparent.
+ 	httpClient := &http.Client{
+-		Timeout: 5 * time.Second,
++		Timeout:   5 * time.Second,
++		Transport: otelhttp.NewTransport(http.DefaultTransport),
+ 	}
+ 
+ 	// Cria a instância da App
+@@ -105,8 +115,15 @@ func main() {
+ 	mux.HandleFunc("/health", app.healthHandler)
+ 	mux.HandleFunc("/evaluate", app.evaluationHandler)
+ 
++	// Instrumenta o servidor: um span por requisição + métricas http.server.* (taxa, latência, status).
++	handler := otelhttp.NewHandler(mux, "evaluation-service",
++		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
++			return r.Method + " " + r.URL.Path
++		}),
++	)
++
+ 	log.Printf("Serviço de Avaliação (Go) rodando na porta %s", port)
+-	if err := http.ListenAndServe(":"+port, mux); err != nil {
++	if err := http.ListenAndServe(":"+port, handler); err != nil {
+ 		log.Fatal(err)
+ 	}
+ }
+\ No newline at end of file
+diff --git a/services/evaluation/sqs.go b/services/evaluation/sqs.go
+index 50aacdc..e3e7ded 100644
+--- a/services/evaluation/sqs.go
++++ b/services/evaluation/sqs.go
+@@ -1,12 +1,19 @@
+ package main
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"log"
++	"path"
+ 	"time"
+ 
+ 	"github.com/aws/aws-sdk-go/aws"
+ 	"github.com/aws/aws-sdk-go/service/sqs"
++	"go.opentelemetry.io/otel"
++	"go.opentelemetry.io/otel/attribute"
++	"go.opentelemetry.io/otel/codes"
++	"go.opentelemetry.io/otel/metric"
++	"go.opentelemetry.io/otel/trace"
+ )
+ 
+ // Evento que será enviado para a fila
+@@ -17,14 +24,51 @@ type EvaluationEvent struct {
+ 	Timestamp time.Time `json:"timestamp"`
+ }
+ 
+-// sendEvaluationEvent envia um evento para a fila SQS
+-func (a *App) sendEvaluationEvent(userID, flagName string, result bool) {
++// sqsCarrier adapta os MessageAttributes do SQS para a propagação de contexto do OpenTelemetry.
++// O traceparent viaja na mensagem e o analytics-service continua o mesmo trace do outro lado da fila.
++type sqsCarrier map[string]*sqs.MessageAttributeValue
++
++func (c sqsCarrier) Get(key string) string {
++	if v, ok := c[key]; ok && v != nil && v.StringValue != nil {
++		return *v.StringValue
++	}
++	return ""
++}
++
++func (c sqsCarrier) Set(key, value string) {
++	c[key] = &sqs.MessageAttributeValue{
++		DataType:    aws.String("String"),
++		StringValue: aws.String(value),
++	}
++}
++
++func (c sqsCarrier) Keys() []string {
++	keys := make([]string, 0, len(c))
++	for k := range c {
++		keys = append(keys, k)
++	}
++	return keys
++}
++
++// sendEvaluationEvent envia um evento para a fila SQS.
++// O ctx deve carregar o span da requisição (sem o cancelamento dela), ver handlers.go.
++func (a *App) sendEvaluationEvent(ctx context.Context, userID, flagName string, result bool) {
+ 	// Se a URL da fila não foi configurada, apenas loga localmente e sai.
+ 	if a.SqsSvc == nil || a.SqsQueueURL == "" {
+ 		log.Printf("[SQS_DISABLED] Evento: User '%s', Flag '%s', Result '%t'", userID, flagName, result)
+ 		return
+ 	}
+ 
++	ctx, span := tracer.Start(ctx, "SQS publish",
++		trace.WithSpanKind(trace.SpanKindProducer),
++		trace.WithAttributes(
++			attribute.String("messaging.system", "aws_sqs"),
++			attribute.String("messaging.destination.name", path.Base(a.SqsQueueURL)),
++			attribute.String("messaging.operation", "publish"),
++		),
++	)
++	defer span.End()
++
+ 	event := EvaluationEvent{
+ 		UserID:    userID,
+ 		FlagName:  flagName,
+@@ -35,18 +79,30 @@ func (a *App) sendEvaluationEvent(userID, flagName string, result bool) {
+ 	body, err := json.Marshal(event)
+ 	if err != nil {
+ 		log.Printf("Erro ao serializar evento SQS: %v", err)
++		span.RecordError(err)
++		span.SetStatus(codes.Error, err.Error())
+ 		return
+ 	}
+ 
++	// Injeta o traceparent nos atributos da mensagem
++	carrier := sqsCarrier{}
++	otel.GetTextMapPropagator().Inject(ctx, carrier)
++
+ 	// Envia a mensagem
+-	_, err = a.SqsSvc.SendMessage(&sqs.SendMessageInput{
+-		MessageBody: aws.String(string(body)),
+-		QueueUrl:    aws.String(a.SqsQueueURL),
++	_, err = a.SqsSvc.SendMessageWithContext(ctx, &sqs.SendMessageInput{
++		MessageBody:       aws.String(string(body)),
++		QueueUrl:          aws.String(a.SqsQueueURL),
++		MessageAttributes: carrier,
+ 	})
+ 
+ 	if err != nil {
+ 		log.Printf("Erro ao enviar mensagem para SQS: %v", err)
+-	} else {
+-		log.Printf("Evento de avaliação enviado para SQS (Flag: %s)", flagName)
++		span.RecordError(err)
++		span.SetStatus(codes.Error, err.Error())
++		eventsSent.Add(ctx, 1, metric.WithAttributes(attribute.String("status", "error")))
++		return
+ 	}
+-}
+\ No newline at end of file
++
++	log.Printf("Evento de avaliação enviado para SQS (Flag: %s)", flagName)
++	eventsSent.Add(ctx, 1, metric.WithAttributes(attribute.String("status", "ok")))
++}
+diff --git a/services/evaluation/telemetry.go b/services/evaluation/telemetry.go
+new file mode 100644
+index 0000000..051c65c
+--- /dev/null
++++ b/services/evaluation/telemetry.go
+@@ -0,0 +1,83 @@
++package main
++
++import (
++	"context"
++	"log"
++	"os"
++	"time"
++
++	"go.opentelemetry.io/otel"
++	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
++	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
++	"go.opentelemetry.io/otel/metric"
++	"go.opentelemetry.io/otel/propagation"
++	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
++	"go.opentelemetry.io/otel/sdk/resource"
++	sdktrace "go.opentelemetry.io/otel/sdk/trace"
++)
++
++var (
++	tracer = otel.Tracer("evaluation-service")
++	meter  = otel.Meter("evaluation-service")
++
++	// Torna visível a falha "silenciosa" de envio ao SQS (status=ok|error).
++	eventsSent, _ = meter.Int64Counter(
++		"evaluation.events.sent",
++		metric.WithDescription("Eventos de avaliação enviados ao SQS"),
++	)
++)
++
++// initTelemetry configura traces e métricas OpenTelemetry (OTLP/HTTP para o OTel Collector).
++// O endpoint vem de OTEL_EXPORTER_OTLP_ENDPOINT e o nome do serviço de OTEL_SERVICE_NAME.
++// Sem endpoint, a telemetria fica desligada (dev local). Sempre devolve uma função de shutdown segura.
++func initTelemetry(ctx context.Context) (func(context.Context), error) {
++	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
++		propagation.TraceContext{}, propagation.Baggage{},
++	))
++
++	noop := func(context.Context) {}
++	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") == "" {
++		log.Println("Telemetria OpenTelemetry desabilitada (OTEL_EXPORTER_OTLP_ENDPOINT não definida).")
++		return noop, nil
++	}
++
++	res, err := resource.New(ctx,
++		resource.WithFromEnv(),
++		resource.WithTelemetrySDK(),
++		resource.WithHost(),
++	)
++	if err != nil {
++		return noop, err
++	}
++
++	traceExp, err := otlptracehttp.New(ctx)
++	if err != nil {
++		return noop, err
++	}
++	tp := sdktrace.NewTracerProvider(
++		sdktrace.WithBatcher(traceExp),
++		sdktrace.WithResource(res),
++	)
++	otel.SetTracerProvider(tp)
++
++	metricExp, err := otlpmetrichttp.New(ctx)
++	if err != nil {
++		_ = tp.Shutdown(ctx)
++		return noop, err
++	}
++	mp := sdkmetric.NewMeterProvider(
++		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricExp, sdkmetric.WithInterval(15*time.Second))),
++		sdkmetric.WithResource(res),
++	)
++	otel.SetMeterProvider(mp)
++
++	log.Println("Telemetria OpenTelemetry habilitada.")
++	return func(c context.Context) {
++		if err := tp.Shutdown(c); err != nil {
++			log.Printf("Erro ao encerrar o tracer provider: %v", err)
++		}
++		if err := mp.Shutdown(c); err != nil {
++			log.Printf("Erro ao encerrar o meter provider: %v", err)
++		}
++	}, nil
++}
+diff --git a/services/flag/app.py b/services/flag/app.py
+index 0ccbf13..3540405 100644
+--- a/services/flag/app.py
++++ b/services/flag/app.py
+@@ -9,15 +9,20 @@ from flask import Flask, request, jsonify
+ from dotenv import load_dotenv
+ from functools import wraps
+ import logging
++from telemetry import init_telemetry, instrument_flask, log_format
++
++# Telemetria (OpenTelemetry -> OTel Collector) antes do logging, para o formato incluir trace_id/span_id
++init_telemetry()
+ 
+ # Configura o logging
+-logging.basicConfig(level=logging.INFO)
++logging.basicConfig(level=logging.INFO, format=log_format())
+ log = logging.getLogger(__name__)
+ 
+ # Carrega .env para desenvolvimento local
+ load_dotenv()
+ 
+ app = Flask(__name__)
++instrument_flask(app)
+ 
+ # --- Configuração ---
+ DATABASE_URL = os.getenv("DATABASE_URL")
+diff --git a/services/flag/requirements.txt b/services/flag/requirements.txt
+index 03a2e94..5d8aa7c 100644
+--- a/services/flag/requirements.txt
++++ b/services/flag/requirements.txt
+@@ -3,4 +3,10 @@ Werkzeug<3
+ psycopg2-binary==2.9.5
+ gunicorn==20.1.0
+ python-dotenv==0.21.0
+-requests==2.28.1
+\ No newline at end of file
++requests==2.28.1
++opentelemetry-sdk==1.45.2
++opentelemetry-exporter-otlp-proto-http==1.45.2
++opentelemetry-instrumentation-flask==0.66b2
++opentelemetry-instrumentation-requests==0.66b2
++opentelemetry-instrumentation-psycopg2==0.66b2
++opentelemetry-instrumentation-logging==0.66b2
+diff --git a/services/flag/telemetry.py b/services/flag/telemetry.py
+new file mode 100644
+index 0000000..8b9c669
+--- /dev/null
++++ b/services/flag/telemetry.py
+@@ -0,0 +1,82 @@
++"""OpenTelemetry: traces e métricas via OTLP/HTTP para o OTel Collector.
++
++- Só é ativado se OTEL_EXPORTER_OTLP_ENDPOINT estiver definida (dev local fica sem telemetria).
++- Nome do serviço e atributos vêm de OTEL_SERVICE_NAME e OTEL_RESOURCE_ATTRIBUTES.
++- Deve rodar no processo que atende as requisições. O gunicorn, sem --preload, importa o app
++  dentro do worker (depois do fork), então as threads do exporter sobrevivem.
++"""
++import os
++
++_BASE_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
++_TRACE_FORMAT = (
++    "%(asctime)s %(levelname)s [%(name)s] "
++    "[trace_id=%(otelTraceID)s span_id=%(otelSpanID)s] %(message)s"
++)
++
++_enabled = False
++
++
++def telemetry_enabled():
++    return bool(os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
++
++
++def init_telemetry():
++    """Configura tracer/meter providers e instrumenta as bibliotecas presentes no serviço."""
++    global _enabled
++    if _enabled or not telemetry_enabled():
++        return _enabled
++
++    from opentelemetry import metrics, trace
++    from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
++    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
++    from opentelemetry.instrumentation.logging import LoggingInstrumentor
++    from opentelemetry.sdk.metrics import MeterProvider
++    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
++    from opentelemetry.sdk.resources import Resource
++    from opentelemetry.sdk.trace import TracerProvider
++    from opentelemetry.sdk.trace.export import BatchSpanProcessor
++
++    resource = Resource.create()  # lê OTEL_SERVICE_NAME e OTEL_RESOURCE_ATTRIBUTES
++
++    tracer_provider = TracerProvider(resource=resource)
++    tracer_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
++    trace.set_tracer_provider(tracer_provider)
++
++    reader = PeriodicExportingMetricReader(OTLPMetricExporter(), export_interval_millis=15000)
++    metrics.set_meter_provider(MeterProvider(resource=resource, metric_readers=[reader]))
++
++    # Acrescenta trace_id/span_id aos registros de log (o formato é definido em log_format())
++    LoggingInstrumentor().instrument(set_logging_format=False)
++
++    # Bibliotecas de saída: o que existir no serviço é instrumentado
++    try:
++        from opentelemetry.instrumentation.requests import RequestsInstrumentor
++        RequestsInstrumentor().instrument()
++    except ImportError:
++        pass
++    try:
++        from opentelemetry.instrumentation.psycopg2 import Psycopg2Instrumentor
++        Psycopg2Instrumentor().instrument()
++    except ImportError:
++        pass
++    try:
++        from opentelemetry.instrumentation.botocore import BotocoreInstrumentor
++        BotocoreInstrumentor().instrument()
++    except ImportError:
++        pass
++
++    _enabled = True
++    return True
++
++
++def instrument_flask(app):
++    """Instrumenta o app Flask: um span por requisição e métricas http.server.*."""
++    if not _enabled:
++        return
++    from opentelemetry.instrumentation.flask import FlaskInstrumentor
++    FlaskInstrumentor().instrument_app(app)
++
++
++def log_format():
++    """Formato de log: com trace_id/span_id só quando a telemetria está ativa."""
++    return _TRACE_FORMAT if _enabled else _BASE_FORMAT
+diff --git a/services/targeting/app.py b/services/targeting/app.py
+index de50c76..aa3d1c7 100644
+--- a/services/targeting/app.py
++++ b/services/targeting/app.py
+@@ -8,15 +8,20 @@ from flask import Flask, request, jsonify
+ from dotenv import load_dotenv
+ from functools import wraps
+ import logging
++from telemetry import init_telemetry, instrument_flask, log_format
++
++# Telemetria (OpenTelemetry -> OTel Collector) antes do logging, para o formato incluir trace_id/span_id
++init_telemetry()
+ 
+ # Configura o logging
+-logging.basicConfig(level=logging.INFO)
++logging.basicConfig(level=logging.INFO, format=log_format())
+ log = logging.getLogger(__name__)
+ 
+ # Carrega .env para desenvolvimento local
+ load_dotenv()
+ 
+ app = Flask(__name__)
++instrument_flask(app)
+ 
+ # --- Configuração ---
+ DATABASE_URL = os.getenv("DATABASE_URL")
+diff --git a/services/targeting/requirements.txt b/services/targeting/requirements.txt
+index 03a2e94..5d8aa7c 100644
+--- a/services/targeting/requirements.txt
++++ b/services/targeting/requirements.txt
+@@ -3,4 +3,10 @@ Werkzeug<3
+ psycopg2-binary==2.9.5
+ gunicorn==20.1.0
+ python-dotenv==0.21.0
+-requests==2.28.1
+\ No newline at end of file
++requests==2.28.1
++opentelemetry-sdk==1.45.2
++opentelemetry-exporter-otlp-proto-http==1.45.2
++opentelemetry-instrumentation-flask==0.66b2
++opentelemetry-instrumentation-requests==0.66b2
++opentelemetry-instrumentation-psycopg2==0.66b2
++opentelemetry-instrumentation-logging==0.66b2
+diff --git a/services/targeting/telemetry.py b/services/targeting/telemetry.py
+new file mode 100644
+index 0000000..8b9c669
+--- /dev/null
++++ b/services/targeting/telemetry.py
+@@ -0,0 +1,82 @@
++"""OpenTelemetry: traces e métricas via OTLP/HTTP para o OTel Collector.
++
++- Só é ativado se OTEL_EXPORTER_OTLP_ENDPOINT estiver definida (dev local fica sem telemetria).
++- Nome do serviço e atributos vêm de OTEL_SERVICE_NAME e OTEL_RESOURCE_ATTRIBUTES.
++- Deve rodar no processo que atende as requisições. O gunicorn, sem --preload, importa o app
++  dentro do worker (depois do fork), então as threads do exporter sobrevivem.
++"""
++import os
++
++_BASE_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
++_TRACE_FORMAT = (
++    "%(asctime)s %(levelname)s [%(name)s] "
++    "[trace_id=%(otelTraceID)s span_id=%(otelSpanID)s] %(message)s"
++)
++
++_enabled = False
++
++
++def telemetry_enabled():
++    return bool(os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
++
++
++def init_telemetry():
++    """Configura tracer/meter providers e instrumenta as bibliotecas presentes no serviço."""
++    global _enabled
++    if _enabled or not telemetry_enabled():
++        return _enabled
++
++    from opentelemetry import metrics, trace
++    from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
++    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
++    from opentelemetry.instrumentation.logging import LoggingInstrumentor
++    from opentelemetry.sdk.metrics import MeterProvider
++    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
++    from opentelemetry.sdk.resources import Resource
++    from opentelemetry.sdk.trace import TracerProvider
++    from opentelemetry.sdk.trace.export import BatchSpanProcessor
++
++    resource = Resource.create()  # lê OTEL_SERVICE_NAME e OTEL_RESOURCE_ATTRIBUTES
++
++    tracer_provider = TracerProvider(resource=resource)
++    tracer_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
++    trace.set_tracer_provider(tracer_provider)
++
++    reader = PeriodicExportingMetricReader(OTLPMetricExporter(), export_interval_millis=15000)
++    metrics.set_meter_provider(MeterProvider(resource=resource, metric_readers=[reader]))
++
++    # Acrescenta trace_id/span_id aos registros de log (o formato é definido em log_format())
++    LoggingInstrumentor().instrument(set_logging_format=False)
++
++    # Bibliotecas de saída: o que existir no serviço é instrumentado
++    try:
++        from opentelemetry.instrumentation.requests import RequestsInstrumentor
++        RequestsInstrumentor().instrument()
++    except ImportError:
++        pass
++    try:
++        from opentelemetry.instrumentation.psycopg2 import Psycopg2Instrumentor
++        Psycopg2Instrumentor().instrument()
++    except ImportError:
++        pass
++    try:
++        from opentelemetry.instrumentation.botocore import BotocoreInstrumentor
++        BotocoreInstrumentor().instrument()
++    except ImportError:
++        pass
++
++    _enabled = True
++    return True
++
++
++def instrument_flask(app):
++    """Instrumenta o app Flask: um span por requisição e métricas http.server.*."""
++    if not _enabled:
++        return
++    from opentelemetry.instrumentation.flask import FlaskInstrumentor
++    FlaskInstrumentor().instrument_app(app)
++
++
++def log_format():
++    """Formato de log: com trace_id/span_id só quando a telemetria está ativa."""
++    return _TRACE_FORMAT if _enabled else _BASE_FORMAT
+-- 
+2.43.0
+
