@@ -1,0 +1,85 @@
+name: Self-healing (rollout restart)
+
+# Auto-reparo acionado pelo alerta do Grafana (webhook -> API de workflow_dispatch do GitHub).
+# Também pode ser executado à mão na aba Actions. Reinicia o Deployment com `kubectl rollout restart`
+# e espera os pods novos ficarem prontos, deixando tudo registrado no log e no resumo da execução.
+on:
+  workflow_dispatch:
+    inputs:
+      deployment:
+        description: Deployment a reiniciar (namespace toggle-app)
+        required: true
+        default: auth-service
+        type: choice
+        options:
+          - auth-service
+          - flag-service
+          - targeting-service
+          - evaluation-service
+          - analytics-service
+      reason:
+        description: Motivo (aparece no log)
+        required: false
+        default: execução manual
+
+permissions:
+  contents: read
+
+# Alertas repetidos para o mesmo serviço não reiniciam em paralelo.
+concurrency:
+  group: self-heal-${{ inputs.deployment }}
+  cancel-in-progress: false
+
+env:
+  CLUSTER_NAME: toggle-master
+  NAMESPACE: toggle-app
+  AWS_REGION: us-east-1
+  DEPLOYMENT: ${{ inputs.deployment }}
+  REASON: ${{ inputs.reason }}
+
+jobs:
+  restart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Contexto do incidente
+        run: |
+          echo "Início (UTC): $(date -u +%FT%TZ)"
+          echo "Deployment:   ${DEPLOYMENT} (namespace ${NAMESPACE})"
+          echo "Motivo:       ${REASON}"
+
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Conectar ao cluster EKS
+        run: aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}"
+
+      - name: Pods antes do restart
+        run: kubectl -n "${NAMESPACE}" get pods -l "app=${DEPLOYMENT}" -o wide
+
+      - name: kubectl rollout restart
+        run: |
+          kubectl -n "${NAMESPACE}" rollout restart "deployment/${DEPLOYMENT}"
+          echo "Restart solicitado em $(date -u +%FT%TZ)"
+
+      - name: Aguardar os pods novos ficarem prontos
+        run: kubectl -n "${NAMESPACE}" rollout status "deployment/${DEPLOYMENT}" --timeout=180s
+
+      - name: Pods depois do restart e resumo
+        run: |
+          kubectl -n "${NAMESPACE}" get pods -l "app=${DEPLOYMENT}" -o wide
+          {
+            echo "## Auto-reparo executado"
+            echo
+            echo "- **Deployment:** \`${DEPLOYMENT}\` (namespace \`${NAMESPACE}\`)"
+            echo "- **Motivo:** ${REASON}"
+            echo "- **Concluído (UTC):** $(date -u +%FT%TZ)"
+            echo
+            echo '```'
+            kubectl -n "${NAMESPACE}" get pods -l "app=${DEPLOYMENT}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

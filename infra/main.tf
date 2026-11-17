@@ -64,6 +64,8 @@ module "ci_access" {
 
   project_name         = var.project_name
   ecr_repository_arns  = values(module.ecr.repository_arns)
+  cluster_name         = module.eks.cluster_name
+  cluster_arn          = module.eks.cluster_arn
 }
 
 module "workload_iam" {
