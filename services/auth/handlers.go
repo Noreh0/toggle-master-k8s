@@ -3,11 +3,22 @@ package main
 import (
 //	"crypto/sha256"
 //	"encoding/hex"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"strings"
+	"sync/atomic"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
+
+// chaosEnabled simula uma falha interna do serviço (só ligável com ENABLE_CHAOS=true).
+// Fica em memória de propósito: reiniciar o pod (self-healing) devolve o serviço ao normal.
+var chaosEnabled atomic.Bool
 
 // Estrutura para o corpo da requisição de criação de chave
 type CreateKeyRequest struct {
@@ -31,6 +42,13 @@ func (a *App) healthHandler(w http.ResponseWriter, r *http.Request) {
 
 // validateKeyHandler verifica se uma chave de API (enviada via Header) é válida
 func (a *App) validateKeyHandler(w http.ResponseWriter, r *http.Request) {
+	// Falha injetada (ver chaosHandler): responde 5xx até o pod ser reiniciado.
+	if chaosEnabled.Load() {
+		log.Println("Falha injetada (chaos): respondendo 500")
+		http.Error(w, "Falha interna injetada para teste de self-healing", http.StatusInternalServerError)
+		return
+	}
+
 	// Extrai a chave do header "Authorization: Bearer <key>"
 	authHeader := r.Header.Get("Authorization")
 	keyString := strings.TrimPrefix(authHeader, "Bearer ")
@@ -45,11 +63,33 @@ func (a *App) validateKeyHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Verifica se o hash existe no banco de dados
 	var id int
-	err := a.DB.QueryRow("SELECT id FROM api_keys WHERE key_hash = $1 AND is_active = true", keyHash).Scan(&id)
+	ctx, span := tracer.Start(r.Context(), "SELECT api_keys",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("db.system", "postgresql"),
+			attribute.String("db.operation", "SELECT"),
+			attribute.String("db.sql.table", "api_keys"),
+		),
+	)
+	err := a.DB.QueryRowContext(ctx, "SELECT id FROM api_keys WHERE key_hash = $1 AND is_active = true", keyHash).Scan(&id)
 	if err != nil {
-		// Se não encontrar (sql.ErrNoRows), ou qualquer outro erro, a chave é inválida
-		log.Printf("Falha na validação da chave (hash: %s...): %v", keyHash[:6], err)
-		http.Error(w, "Chave de API inválida ou inativa", http.StatusUnauthorized)
+		span.RecordError(err)
+		if !errors.Is(err, sql.ErrNoRows) {
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}
+	span.End()
+
+	if err != nil {
+		// Chave inexistente ou inativa: 401 (erro do cliente)
+		if errors.Is(err, sql.ErrNoRows) {
+			log.Printf("Falha na validação da chave (hash: %s...): chave inválida ou inativa", keyHash[:6])
+			http.Error(w, "Chave de API inválida ou inativa", http.StatusUnauthorized)
+			return
+		}
+		// Qualquer outro erro (banco fora, timeout) é falha NOSSA: 503, para aparecer como 5xx nas métricas/alertas
+		log.Printf("Erro ao consultar o banco na validação da chave: %v", err)
+		http.Error(w, "Serviço de validação indisponível", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -107,6 +147,29 @@ func (a *App) createKeyHandler(w http.ResponseWriter, r *http.Request) {
 		Message: "Guarde esta chave com segurança! Você não poderá vê-la novamente.",
 	}); err != nil {
 		log.Printf("Erro ao escrever resposta de criação de chave: %v", err)
+	}
+}
+
+// chaosHandler liga/desliga a falha injetada: POST /admin/chaos {"enabled": true|false}
+// (protegido pelo masterKeyAuthMiddleware; registrado só com ENABLE_CHAOS=true)
+func (a *App) chaosHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Corpo da requisição inválido", http.StatusBadRequest)
+		return
+	}
+
+	chaosEnabled.Store(req.Enabled)
+	log.Printf("Chaos alterado: enabled=%t", req.Enabled)
+	if err := json.NewEncoder(w).Encode(map[string]bool{"chaos": req.Enabled}); err != nil {
+		log.Printf("Erro ao escrever resposta do chaos: %v", err)
 	}
 }
 

@@ -8,15 +8,20 @@ from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from functools import wraps
 import logging
+from telemetry import init_telemetry, instrument_flask, log_format
+
+# Telemetria (OpenTelemetry -> OTel Collector) antes do logging, para o formato incluir trace_id/span_id
+init_telemetry()
 
 # Configura o logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format=log_format())
 log = logging.getLogger(__name__)
 
 # Carrega .env para desenvolvimento local
 load_dotenv()
 
 app = Flask(__name__)
+instrument_flask(app)
 
 # --- Configuração ---
 DATABASE_URL = os.getenv("DATABASE_URL")

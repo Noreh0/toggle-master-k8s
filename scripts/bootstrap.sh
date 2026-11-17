@@ -200,17 +200,16 @@ phase_secrets() {
     --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   info "grafana-admin ($NS_MON) ok"
 
-  local missing=()
-  [[ -n "${PAGERDUTY_INTEGRATION_KEY:-}" ]] || missing+=(PAGERDUTY_INTEGRATION_KEY)
-  [[ -n "${DISCORD_WEBHOOK_URL:-}" ]] || missing+=(DISCORD_WEBHOOK_URL)
-  [[ -n "${GITHUB_DISPATCH_TOKEN:-}" ]] || missing+=(GITHUB_DISPATCH_TOKEN)
-  if ((${#missing[@]})); then
-    warn "Sem valor para: ${missing[*]} (os contact points do Grafana ficarão sem eles)."
-  fi
+  # Valores vazios derrubariam o provisionamento dos contact points no start do Grafana,
+  # então entram valores de preenchimento (os envios para esses canais simplesmente falham).
+  local pd_key="${PAGERDUTY_INTEGRATION_KEY:-}" discord_url="${DISCORD_WEBHOOK_URL:-}" gh_token="${GITHUB_DISPATCH_TOKEN:-}"
+  [[ -n "$pd_key" ]] || { warn "PAGERDUTY_INTEGRATION_KEY vazia: o incidente não será criado."; pd_key="nao-configurado"; }
+  [[ -n "$discord_url" ]] || { warn "DISCORD_WEBHOOK_URL vazia: sem aviso no Discord."; discord_url="http://localhost/nao-configurado"; }
+  [[ -n "$gh_token" ]] || { warn "GITHUB_DISPATCH_TOKEN vazia: o auto-reparo não será disparado."; gh_token="nao-configurado"; }
   kubectl -n "$NS_MON" create secret generic grafana-alerting-secrets \
-    --from-literal=PAGERDUTY_INTEGRATION_KEY="${PAGERDUTY_INTEGRATION_KEY:-}" \
-    --from-literal=DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL:-}" \
-    --from-literal=GITHUB_DISPATCH_TOKEN="${GITHUB_DISPATCH_TOKEN:-}" \
+    --from-literal=PAGERDUTY_INTEGRATION_KEY="$pd_key" \
+    --from-literal=DISCORD_WEBHOOK_URL="$discord_url" \
+    --from-literal=GITHUB_DISPATCH_TOKEN="$gh_token" \
     --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   info "grafana-alerting-secrets ($NS_MON) ok"
 }
