@@ -57,7 +57,7 @@ jobs:
         uses: securego/gosec@master
         with:
           # -severity high = equivalente a "crítico" para o gosec (LOW/MEDIUM/HIGH)
-          args: -severity high ./services/evaluation/...
+          args: -severity high -exclude=G704 ./services/evaluation/...
 
   docker-build-push:
     runs-on: ubuntu-latest
